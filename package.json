@@ -1,11 +1,12 @@
 {
   "name": "opencode2dsh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH (DeepSeek Harness / DSH Desktop) plugin: use OpenCode's free models inside DSH with per-model endpoints, vision, context, output and reasoning settings — no API key, no extra process.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -19,7 +20,9 @@
     "node": ">=20.19.0"
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --legal-comments=none",
+    "build": "npm run build:node && npm run build:client",
+    "build:node": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --legal-comments=none",
+    "build:client": "node scripts/build-client.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "smoke": "node --import tsx scripts/smoke.ts",
@@ -42,6 +45,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
     }
   },
   "devDependencies": {

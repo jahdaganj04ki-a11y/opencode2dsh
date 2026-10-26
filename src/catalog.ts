@@ -58,6 +58,24 @@ interface ListingEnvelope {
   models?: Array<{ id?: unknown }>
 }
 
+/**
+ * Read-only catalog view served by the settings bridge. The browser card
+ * renders exactly this surface; it never reaches into catalog internals.
+ */
+export interface CatalogSnapshot {
+  state: CatalogState
+  /** At least one live gateway answer has been committed in this process. */
+  live: boolean
+  /** Raw gateway ids currently held (before free-rule/blocklist filtering). */
+  total: number
+  /** The ids the model picker actually exposes right now. */
+  eligible: string[]
+  lastError?: string
+  etag?: string
+  /** Epoch ms of the last successful gateway answer (304 included). */
+  lastFetchAt?: number
+}
+
 export interface CatalogOptions {
   /** Backoff delays between startup retries; the last entry is repeated. */
   retrySchedule?: number[]
@@ -86,6 +104,7 @@ export class ModelCatalog {
   private disposed = false
   private publishedSignature: string | undefined
   private etag: string | undefined
+  private lastFetchAt: number | undefined
   private readonly retrySchedule: number[]
   private readonly unrefTimers: boolean
   private readonly metricsProvider?: () => unknown
@@ -218,6 +237,7 @@ export class ModelCatalog {
         this.hasLive = true
         this.state = 'ready'
         this.lastError = undefined
+        this.lastFetchAt = this.now()
         if (result.etag) this.etag = result.etag
         if (this.config.diskCache) {
           this.store.write(CATALOG_CACHE_FILE, { at: this.now(), ids: this.ids, ...(this.etag ? { etag: this.etag } : {}) } satisfies CachedCatalog)
@@ -251,6 +271,7 @@ export class ModelCatalog {
       this.hasLive = true
       this.state = 'ready'
       this.lastError = undefined
+      this.lastFetchAt = this.now()
       if (this.config.diskCache) {
         this.store.write(CATALOG_CACHE_FILE, {
           at: this.now(),
@@ -319,6 +340,30 @@ export class ModelCatalog {
   /** Apply free-rule, blocklist, allowlist and de-dupe to the raw ids. */
   eligibleIds(): string[] {
     return this.eligibleFrom(this.ids)
+  }
+
+  /** Read-only state for the settings-page bridge. */
+  snapshot(): CatalogSnapshot {
+    return {
+      state: this.state,
+      live: this.hasLive,
+      total: this.ids.length,
+      eligible: this.eligibleIds(),
+      ...(this.lastError ? { lastError: this.lastError } : {}),
+      ...(this.etag ? { etag: this.etag } : {}),
+      ...(this.lastFetchAt ? { lastFetchAt: this.lastFetchAt } : {}),
+    }
+  }
+
+  /**
+   * Re-publish the current roster unconditionally. The manual refresh button
+   * uses this after its forced fetch: a 304 or an unchanged listing would
+   * otherwise skip `announceIfChanged`, leaving cached model pickers stale
+   * even though the user explicitly asked for a re-sync.
+   */
+  forceAnnounce(): void {
+    this.publishedSignature = undefined
+    this.announceIfChanged()
   }
 
   async listModels(provider: string): Promise<ModelInfo[]> {

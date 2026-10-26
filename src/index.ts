@@ -12,8 +12,14 @@
  */
 
 import { OpenCodeFreeAdapter } from './adapter.js'
+import { BRIDGE_PREFIX, mountCatalogBridge } from './bridge.js'
 import { DEFAULT_PROVIDER_ID, resolveConfig, type PluginConfig } from './config.js'
-import type { AdapterRegistrationHandle, PluginContext } from './types.js'
+import type {
+  AdapterRegistrationHandle,
+  PluginContext,
+  WebServerPluginContext,
+  WebServerService,
+} from './types.js'
 
 export const name = 'opencode2dsh'
 export const inject = ['llm']
@@ -56,6 +62,8 @@ export function apply(ctx: PluginContext, rawConfig?: PluginConfig): void {
   // any roster a previous generation left cached.
   announce()
 
+  mountSettingsBridge(ctx, adapter)
+
   ctx.logger.info?.(`[opencode2dsh] provider "${providerId}" registered (${PROVIDER_LABEL})`)
 
   ctx.effect?.(() => () => {
@@ -63,6 +71,60 @@ export function apply(ctx: PluginContext, rawConfig?: PluginConfig): void {
       handle?.()
     } catch {
       // Already unregistered by host teardown.
+    }
+  })
+}
+
+/**
+ * Mount the browser-card bridge in a *separate* scoped fiber.
+ *
+ * `webServer` must never join the top-level `inject` list: on host 0.1.5+ a
+ * service there that a profile does not provide fails the whole plugin tree
+ * load. A scoped `ctx.inject(['webServer'], …)` simply never activates on
+ * headless/CLI profiles, while the LLM provider above keeps working. Any
+ * failure here degrades to "no refresh button backend" only, never to a
+ * dead adapter.
+ */
+function mountSettingsBridge(ctx: PluginContext, adapter: OpenCodeFreeAdapter): void {
+  if (typeof ctx.inject !== 'function') return
+  ctx.inject(['webServer'], (rawWebCtx: PluginContext) => {
+    try {
+      const webCtx = rawWebCtx as WebServerPluginContext
+      const webServer: WebServerService | undefined = webCtx.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      const disposers = mountCatalogBridge(webServer, {
+        async refresh() {
+          try {
+            await adapter.refreshModels()
+            // Re-announce even when the listing was unchanged (304): the
+            // explicit user action must re-sync every cached picker.
+            adapter.announceRoster()
+            return { ok: true as const, value: { ...adapter.modelSnapshot(), refreshedAt: Date.now() } }
+          } catch (error) {
+            // Honest classification; the catalog keeps serving its last good
+            // roster, which travels back in the same envelope.
+            return {
+              ok: false as const,
+              code: 'refresh-failed',
+              message: error instanceof Error ? error.message : String(error),
+              snapshot: adapter.modelSnapshot(),
+            }
+          }
+        },
+        snapshot: () => adapter.modelSnapshot(),
+      })
+      webCtx.effect?.(() => () => {
+        for (const dispose of disposers) {
+          try {
+            dispose()
+          } catch {
+            // Host already tore the route down during fiber disposal.
+          }
+        }
+      })
+      ctx.logger.info?.(`[opencode2dsh] settings bridge mounted at ${BRIDGE_PREFIX} (${disposers.length} routes)`)
+    } catch (error) {
+      ctx.logger.warn?.('[opencode2dsh] settings bridge not mounted', error)
     }
   })
 }

@@ -216,3 +216,39 @@ export interface PluginContext {
   on?(event: string, listener: (...args: never[]) => unknown): () => void
   emit?(event: string, ...args: unknown[]): unknown
 }
+
+// ── webServer bridge (structural slice of dsh-web-server 0.2.x) ─────────────
+
+/** Node:http-shaped request the webServer route handler receives. */
+export interface BridgeHttpRequest extends AsyncIterable<Uint8Array> {
+  method?: string
+  url?: string
+  headers: Record<string, string | string[] | undefined>
+  socket?: { remoteAddress?: string }
+  [Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array>
+}
+
+/** Node:http-shaped response the route handler writes. */
+export interface BridgeHttpResponse {
+  statusCode: number
+  setHeader(name: string, value: string | string[]): unknown
+  writeHead(status: number, headers: Record<string, string>): unknown
+  end(chunk?: string | Uint8Array): unknown
+}
+
+/** Exact-match route as accepted by `webServer.register`. */
+export interface WebServerRoute {
+  kind: 'exact'
+  path: string
+  handler: (req: BridgeHttpRequest, res: BridgeHttpResponse) => void | Promise<void>
+}
+
+/** Structural slice of the host's webServer service. */
+export interface WebServerService {
+  register(route: WebServerRoute): () => void
+}
+
+/** Context handed to the scoped `ctx.inject(['webServer'], …)` fiber. */
+export interface WebServerPluginContext extends PluginContext {
+  webServer: WebServerService
+}

@@ -21,7 +21,7 @@ import { capabilitiesFor, baseModelId } from './capabilities.js'
 import { resolveConfig, type PluginConfig, type ResolvedConfig } from './config.js'
 import { JsonStore, resolveDataDir, resolveDshHome } from './store.js'
 import { TurnMetrics } from './metrics.js'
-import { ModelCatalog } from './catalog.js'
+import { ModelCatalog, type CatalogSnapshot } from './catalog.js'
 import { applyFingerprint, gatewayHeaders, sessionForConversation } from './fingerprint.js'
 import { CODE, GatewayFailure, StreamTimeout, openGatewayStream } from './http.js'
 import {
@@ -329,6 +329,25 @@ export class OpenCodeFreeAdapter {
 
   async listModels(_provider?: string): Promise<ModelInfo[]> {
     return this.catalog.listModels(this.config.providerId)
+  }
+
+  /**
+   * Force one listing fetch now (de-duplicated against any in-flight interval
+   * or retry work). Throws the gateway failure so the bridge can report the
+   * honest reason; the catalog keeps serving its last good roster on failure.
+   */
+  async refreshModels(): Promise<void> {
+    await this.catalog.refresh()
+  }
+
+  /** Re-announce the current roster even when its content did not change. */
+  announceRoster(): void {
+    this.catalog.forceAnnounce()
+  }
+
+  /** Read-only catalog state for the settings-page status route. */
+  modelSnapshot(): CatalogSnapshot {
+    return this.catalog.snapshot()
   }
 
   resolveModel(_provider: string, model: string, _signal?: AbortSignal): ResolvedModelInfo {

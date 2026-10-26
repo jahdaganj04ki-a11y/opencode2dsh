@@ -54,14 +54,14 @@ The plugin reproduces the full current v2 client shape (gate state of
 
 ## Install on Windows x64 (DSH Desktop v0.12.1)
 
-You need one file: the packed plugin **`opencode2dsh-0.1.0.tgz`**. Build it
+You need one file: the packed plugin **`opencode2dsh-0.1.1.tgz`**. Build it
 from source (Node.js ≥ 20.19) or take it from the release artifacts:
 
 ```powershell
 npm ci
 npm run build
 npm pack
-# -> opencode2dsh-0.1.0.tgz
+# -> opencode2dsh-0.1.1.tgz
 ```
 
 The `web` profile is the one DSH Desktop loads. Two installation paths reach
@@ -72,7 +72,7 @@ it; both leave the profile manifest to the host plugin manager.
 1. Open DSH Desktop and go to the sidebar **Plugins** page (also reachable as
    *Workbench management → Installed* in builds that use that wording).
 2. Choose the local-package install action and select
-   `opencode2dsh-0.1.0.tgz`. The shipped build decides whether this entry is
+   `opencode2dsh-0.1.1.tgz`. The shipped build decides whether this entry is
    offered for a local `.tgz`; if the page only knows registry packages, use
    Path B.
 3. Let the installer finish, then **fully quit and reopen DSH Desktop**
@@ -83,7 +83,7 @@ it; both leave the profile manifest to the host plugin manager.
 In PowerShell, from the folder holding the tarball:
 
 ```powershell
-dsh plugin --profile web add .\opencode2dsh-0.1.0.tgz
+dsh plugin --profile web add .\opencode2dsh-0.1.1.tgz
 ```
 
 `--profile web` belongs between `plugin` and the operation, exactly as the
@@ -142,8 +142,48 @@ The DSH plugin manager stages the package in a content-hashed generation under
 `$DSH_HOME/profiles/.generations/live/` with `node-linker=hoisted`, strips
 React/`@deepseek-ai/*` singletons, and inserts the Cordis row from
 `cordis.patch.yml`. This plugin has no install scripts and no runtime
-dependencies (the bundle imports Node built-ins only), so the generation
-contains just the one bundle.
+dependencies (the node bundle imports Node built-ins only; the browser
+bundle uses the shell-provided `react`), so the generation contains just the
+plugin's own two bundles (`dist/index.js`, `dist/client.js`).
+
+---
+
+## Refreshing the free-model list manually
+
+The list is re-fetched from the gateway automatically on every program start
+(with backoff, disk cache and 304 revalidation). On top of that the plugin
+contributes its own settings section so a forced fetch is one click away:
+
+1. Open **Settings** in DSH Desktop.
+2. Open the **OpenCode Free** section (an entry in the settings navigation).
+3. The card shows the list state (Live / cached / offline), the count and
+   ids of the currently usable free models, and the timestamp of the last
+   successful fetch.
+4. **Refresh model list** forces a fresh listing fetch immediately. The
+   plugin then re-announces the provider roster to the host, so the model
+   picker picks up the new state even when the gateway answered 304
+   ("unchanged").
+
+If the fetch fails (network or gateway), the previous list stays visible and
+the card shows the honest error message instead of swallowing the failure.
+All labels are bilingual (German/English) and follow the active host language.
+
+### How the button is wired
+
+- The client (`dist/client.js`) is a single-file ModuleLoader unit
+  (`window.__ModuleLoader__.load({ id: 'opencode2dsh', … })`); its only
+  external is the shell-provided `react`, and it has no value import of any
+  `@deepseek-ai/*` package.
+- Its two calls go same-origin to the plugin's own loopback routes
+  `GET /api/opencode2dsh/status` and `POST /api/opencode2dsh/refresh`.
+- The routes live in a tightly scoped fiber
+  (`ctx.inject(['webServer'], …)`); on profiles without a web server
+  (CLI/headless) the fiber never activates, while the LLM provider keeps
+  working unchanged.
+- Every bridge request must satisfy three conditions: loopback socket,
+  canonical loopback `Host` header and a same-origin marker; anything else
+  gets a 403. Request bodies are capped at 16 KiB.
+- No new runtime dependencies and no extra process are involved.
 
 ---
 
@@ -330,8 +370,8 @@ shipping modules (`src/fingerprint.ts`, `src/http.ts`, `src/stream.ts`).
 ```powershell
 npm install
 npm run typecheck   # strict TypeScript, noUncheckedIndexedAccess
-npm test            # node:test + tsx, 35 tests (wires, fingerprint, engine)
-npm run build       # esbuild → dist/index.js (single ESM bundle, no deps)
+npm test            # node:test + tsx, 82 tests (wires, fingerprint, engine, bridge, client bundle)
+npm run build       # two bundles: dist/index.js (node/ESM) and dist/client.js (browser/ModuleLoader)
 npm run smoke       # live gateway check, needs real internet egress
 ```
 
@@ -339,9 +379,11 @@ Source layout:
 
 | Module | Responsibility |
 |---|---|
-| `src/index.ts` | Cordis plugin entry, adapter registration/disposal. |
+| `src/index.ts` | Cordis plugin entry, adapter registration/disposal, bridge fiber. |
 | `src/adapter.ts` | LlmAdapter surface, two-attempt turn engine, failure mapping. |
-| `src/catalog.ts` | Live listing, warm-up, cache, static fallback, health file. |
+| `src/bridge.ts` | Loopback/same-origin bridge (`/api/opencode2dsh/*`) with trust guard. |
+| `src/client/index.ts` | Browser half: settings section, refresh button, de/en copy. |
+| `src/catalog.ts` | Live listing, warm-up, cache, static fallback, health file, snapshot. |
 | `src/capabilities.ts` | Per-model capability table, family fallbacks, blocklist. |
 | `src/fingerprint.ts` | v2 session minting, headers, tool fingerprint, aliases. |
 | `src/http.ts` | POST/SSE transport, watchdogs, failure classification. |
@@ -349,3 +391,4 @@ Source layout:
 | `src/stream.ts` | SSE → indexed harness blocks for all three wires, usage. |
 | `src/effort.ts` | Reasoning menus and per-family effort field patches. |
 | `src/store.ts` / `src/config.ts` / `src/types.ts` | Persistence, validation, structural host contract. |
+| `scripts/build-client.mjs` | esbuild wrapper for the ModuleLoader bundle (react external). |

@@ -242,3 +242,58 @@ test('the ETag survives a disk-cache restart and is re-sent by the next catalog 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('snapshot() exposes live state, eligible ids and the last fetch timestamp', async () => {
+  const catalog = track(makeCatalog())
+  const boot = catalog.snapshot()
+  assert.equal(boot.state, 'bootstrapping')
+  assert.equal(boot.live, false)
+  assert.equal(boot.lastFetchAt, undefined)
+  assert.deepEqual(boot.eligible, [], 'nothing is exposed before start() hydrates the roster')
+
+  mock.method(globalThis, 'fetch', async () => listingResponse(liveIds))
+  catalog.start()
+  await catalog.warm(3000)
+
+  const live = catalog.snapshot()
+  assert.equal(live.state, 'ready')
+  assert.equal(live.live, true)
+  assert.equal(typeof live.lastFetchAt, 'number')
+  assert.deepEqual(live.eligible, catalog.eligibleIds())
+  assert.ok(live.total >= live.eligible.length)
+  assert.equal(live.lastError, undefined)
+})
+
+test('forceAnnounce() re-publishes an unchanged roster for the manual refresh button', async () => {
+  let calls = 0
+  const catalog = track(makeCatalog(() => {
+    calls += 1
+  }))
+  mock.method(globalThis, 'fetch', async () => listingResponse(liveIds))
+  catalog.start()
+  await catalog.warm(3000)
+  const afterFirst = calls
+  assert.ok(afterFirst >= 1)
+
+  // An identical listing changes nothing, so a plain refresh stays quiet.
+  await catalog.refresh()
+  assert.equal(calls, afterFirst)
+
+  // The button path re-announces unconditionally so cached pickers re-sync.
+  catalog.forceAnnounce()
+  assert.equal(calls, afterFirst + 1)
+})
+
+test('a failed fetch leaves the snapshot honest about the error and the fallback roster', async () => {
+  const catalog = track(makeCatalog())
+  mock.method(globalThis, 'fetch', async () => {
+    throw new TypeError('gateway unreachable')
+  })
+  catalog.start()
+  await catalog.refresh().catch(() => undefined)
+
+  const snap = catalog.snapshot()
+  assert.equal(snap.live, false)
+  assert.match(snap.lastError ?? '', /gateway unreachable/)
+  assert.ok(snap.eligible.length > 0, 'static roster keeps the picker usable offline')
+})

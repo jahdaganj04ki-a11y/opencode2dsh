@@ -56,7 +56,7 @@ Oktober 2026), vollständig im Prozess:
 
 ## Installation unter Windows x64 (DSH Desktop v0.12.1)
 
-Es genügt eine Datei: das gepackte Plugin **`opencode2dsh-0.1.0.tgz`**. Es
+Es genügt eine Datei: das gepackte Plugin **`opencode2dsh-0.1.1.tgz`**. Es
 wird aus dem Quelltext erzeugt (Node.js ≥ 20.19) oder über die
 Release-Artefakte bezogen:
 
@@ -64,7 +64,7 @@ Release-Artefakte bezogen:
 npm ci
 npm run build
 npm pack
-# -> opencode2dsh-0.1.0.tgz
+# -> opencode2dsh-0.1.1.tgz
 ```
 
 Geladen wird das `web`-Profil des DSH Desktop. Es gibt zwei Wege dorthin;
@@ -75,18 +75,18 @@ beide überlassen die Profil-Änderung dem Host-Plugin-Manager.
 1. In DSH Desktop in der Seitenleiste die Seite **Plugins** öffnen (in
    manchen Builds heißt der Eintrag *Workbench-Verwaltung → Installiert*).
 2. Die Aktion für die lokale Paketinstallation wählen und
-   `opencode2dsh-0.1.0.tgz` auswählen. Ob der ausgelieferte Build einen
+   `opencode2dsh-0.1.1.tgz` auswählen. Ob der ausgelieferte Build einen
    Datei-Picker für lokale `.tgz` anbietet, entscheidet die App selbst; gibt
    es diesen Eintrag nicht, führt Weg B zum Ziel.
 3. Den Installer abschließen und DSH Desktop dann **vollständig beenden und
-   neu starten** (Fenster schließen alone genügt nicht).
+   neu starten** (das Fenster allein zu schließen genügt nicht).
 
 ### Weg B – über die `dsh`-CLI (funktioniert auch ohne Datei-Picker)
 
 In der PowerShell, im Ordner mit dem Tarball:
 
 ```powershell
-dsh plugin --profile web add .\opencode2dsh-0.1.0.tgz
+dsh plugin --profile web add .\opencode2dsh-0.1.1.tgz
 ```
 
 `--profile web` steht – wie beim Aufruf durch den Host-Plugin-Manager selbst
@@ -149,8 +149,53 @@ angewandt.
 Der DSH-Plugin-Manager staget das Paket in einer Content-Hash-Generation unter
 `$DSH_HOME/profiles/.generations/live/` mit `node-linker=hoisted`, entfernt
 React-/`@deepseek-ai/*`-Singletons und fügt die Cordis-Zeile ein. Dieses
-Plugin hat keine Installskripte und keine Laufzeitabhängigkeiten (das Bundle
-importiert nur Node-Builtins) – die Generation enthält nur das eine Bundle.
+Plugin hat keine Installskripte und keine Laufzeitabhängigkeiten (die Bundles
+importieren nur Node-Builtins bzw. das vom Host bereitgestellte `react`) –
+die Generation enthält nur die zwei eigenen Bundles
+(`dist/index.js`, `dist/client.js`).
+
+---
+
+## Free-Modellliste manuell aktualisieren
+
+Die Liste wird bei jedem Programmstart automatisch frisch vom Gateway
+abgerufen (mit Backoff, Disk-Cache und 304-Abgleich). Zusätzlich bringt das
+Plugin einen eigenen Einstellungsbereich mit, über den sich jederzeit ein
+erzwungener Abruf auslösen lässt:
+
+1. In DSH Desktop die **Einstellungen** öffnen.
+2. Den Bereich **OpenCode Free** öffnen (Eintrag im Navigationsmenü der
+   Einstellungsseiten).
+3. Die Karte zeigt den Zustand der Liste (Live / zwischengespeichert /
+   Offline), die Anzahl und die IDs der aktuell nutzbaren Free-Modelle sowie
+   den Zeitpunkt des letzten erfolgreichen Abrufs.
+4. Über **Modellliste aktualisieren** wird sofort ein neuer Listing-Abruf
+   erzwungen. Danach meldet das Plugin das Provider-Roster neu an den Host,
+   sodass der Modell-Picker den neuen Stand auch dann übernimmt, wenn das
+   Gateway mit 304 „unverändert" geantwortet hat.
+
+Schlägt der Abruf fehl (Netzwerk oder Gateway), bleibt die bisherige Liste
+sichtbar; die Karte zeigt die ehrliche Fehlermeldung, statt den Fehler zu
+verschlucken. Die Beschriftungen liegen zweisprachig vor (Deutsch/Englisch)
+und folgen der aktiven Host-Sprache.
+
+### Technische Verdrahtung des Buttons
+
+- Der Client (`dist/client.js`) ist eine Ein-Datei-Modul-Loader-Einheit
+  (`window.__ModuleLoader__.load({ id: 'opencode2dsh', … })`), die einzig
+  `react` als vom Host bereitgestelltes External nutzt; sie importiert kein
+  `@deepseek-ai/*`-Paket wertgebend.
+- Seine zwei Aufrufe gehen same-origin an die vom Plugin selbst
+  ausgelieferten Loopback-Routen `GET /api/opencode2dsh/status` und
+  `POST /api/opencode2dsh/refresh`.
+- Die Routen hängen an einer eigenen, eng begrenzten Faser
+  (`ctx.inject(['webServer'], …)`); auf Profilen ohne WebServer (CLI/Headless)
+  wird diese Faser gar nicht erst aktiviert, der LLM-Provider arbeitet
+  unverändert weiter.
+- Jede Bridge-Anfrage muss drei Bedingungen erfüllen: Loopback-Socket,
+  kanonischer Loopback-`Host`-Header und Same-Origin-Marker; alles andere
+  antwortet mit 403. Request-Bodies sind auf 16 KiB gedeckelt.
+- Es gibt keine neuen Laufzeitabhängigkeiten und keinen Zusatzprozess.
 
 ---
 
@@ -347,8 +392,8 @@ abgelehnt wird. Es nutzt exakt die ausgelieferten Module
 ```powershell
 npm install
 npm run typecheck   # striktes TypeScript, noUncheckedIndexedAccess
-npm test            # node:test + tsx, 35 Tests (Wires, Fingerprint, Engine)
-npm run build       # esbuild → dist/index.js (einzelnes ESM-Bundle, keine Deps)
+npm test            # node:test + tsx, 82 Tests (Wires, Fingerprint, Engine, Bridge, Client-Bundle)
+npm run build       # zwei Bundles: dist/index.js (Node/ESM) und dist/client.js (Browser/ModuleLoader)
 npm run smoke       # Live-Gateway-Check, braucht echten Internet-Egress
 ```
 
@@ -356,9 +401,11 @@ Quellstruktur:
 
 | Modul | Verantwortung |
 |---|---|
-| `src/index.ts` | Cordis-Plugin-Einstieg, Adapter-Registrierung/Entsorgung. |
+| `src/index.ts` | Cordis-Plugin-Einstieg, Adapter-Registrierung/Entsorgung, Bridge-Faser. |
 | `src/adapter.ts` | LlmAdapter-Oberfläche, Zwei-Versuch-Rundenengine, Fehlermapping. |
-| `src/catalog.ts` | Live-Listing, Warm-up, Cache, Static-Fallback, Health-Datei. |
+| `src/bridge.ts` | Loopback-/Same-Origin-Bridge (`/api/opencode2dsh/*`) mit Trust-Guard. |
+| `src/client/index.ts` | Browser-Hälfte: Einstellungsbereich, Refresh-Button, de/en-Dialogtexte. |
+| `src/catalog.ts` | Live-Listing, Warm-up, Cache, Static-Fallback, Health-Datei, Snapshot. |
 | `src/capabilities.ts` | Pro-Modell-Fähigkeitstabelle, Familien-Fallbacks, Blocklist. |
 | `src/fingerprint.ts` | v2-Sitzungs-Minting, Header, Tool-Fingerprint, Aliase. |
 | `src/http.ts` | POST/SSE-Transport, Watchdogs, Fehlerklassifizierung. |
@@ -366,3 +413,4 @@ Quellstruktur:
 | `src/stream.ts` | SSE → indizierte Harness-Blöcke für alle drei Wires, Usage. |
 | `src/effort.ts` | Reasoning-Menüs und familien­spezifische Effort-Patches. |
 | `src/store.ts` / `src/config.ts` / `src/types.ts` | Persistenz, Validierung, struktureller Host-Vertrag. |
+| `scripts/build-client.mjs` | esbuild-Wrapper für das ModuleLoader-Bundle (react external). |
