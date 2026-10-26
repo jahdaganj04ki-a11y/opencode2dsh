@@ -14,7 +14,6 @@
  *     ceiling that asks the host to offload instead of bloating the request.
  */
 
-import { readFileSync } from 'node:fs'
 import { extname } from 'node:path'
 import { GatewayFailure, CODE } from './http.js'
 import type {
@@ -28,17 +27,31 @@ import type {
 import type { WireKind } from './capabilities.js'
 
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+/** Combined ceiling for every image embedded in one request body. */
+export const MAX_TOTAL_IMAGE_BYTES = 16 * 1024 * 1024
 
 const INTERRUPTED_RESULT = 'Tool execution was interrupted before its result was recorded.'
 
-export interface ImageResolver {
-  /** Absolute host path for an attachment ref, or undefined when unavailable. */
-  hostPath(ref: ImageAttachmentRef): string | undefined
+export interface LoadedImage {
+  mediaType: string
+  data: Uint8Array
+}
+
+/**
+ * Loads one normalized image attachment into request-ready bytes. The
+ * production implementation goes through the host `attachments` service
+ * (which can downscale to an adapter-declared byte target), then host-path
+ * reads, then the `$DSH_HOME` storage convention.
+ */
+export interface ImageSource {
+  load(ref: ImageAttachmentRef, signal?: AbortSignal): Promise<LoadedImage | undefined>
 }
 
 interface ResolvedImage {
   mediaType: string
   dataUrl: string
+  base64: string
+  bytes: number
 }
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -50,31 +63,31 @@ const MIME_BY_EXT: Record<string, string> = {
   '.bmp': 'image/bmp',
 }
 
-function resolveImage(block: ImageBlock, resolver: ImageResolver): ResolvedImage {
+async function resolveImage(
+  block: ImageBlock,
+  source: ImageSource,
+  signal: AbortSignal | undefined,
+): Promise<ResolvedImage> {
   if (block.offloaded) {
     throw new GatewayFailure('Image was offloaded by the host and cannot be re-read.', CODE.OFFLOAD)
   }
-  const path = resolver.hostPath(block.attachment)
-  if (!path) {
+  const loaded = await source.load(block.attachment, signal)
+  if (!loaded) {
     throw new GatewayFailure('Image attachment has no resolvable host path.', CODE.OFFLOAD)
   }
-  let bytes: Buffer
-  try {
-    bytes = readFileSync(path)
-  } catch {
-    throw new GatewayFailure(`Image attachment is unreadable at ${path}.`, CODE.OFFLOAD)
-  }
-  if (bytes.byteLength > MAX_IMAGE_BYTES) {
+  if (loaded.data.byteLength > MAX_IMAGE_BYTES) {
     throw new GatewayFailure(
       `Image attachment exceeds the ${MAX_IMAGE_BYTES / 1024 / 1024} MB gateway ceiling.`,
       CODE.OFFLOAD,
     )
   }
+  const attachmentName = typeof block.attachment.name === 'string' ? block.attachment.name : ''
   const mediaType =
-    block.attachment.mediaType && /^image\/[a-z0-9.+-]+$/i.test(block.attachment.mediaType)
-      ? block.attachment.mediaType.toLowerCase()
-      : (MIME_BY_EXT[extname(path).toLowerCase()] ?? 'image/png')
-  return { mediaType, dataUrl: `data:${mediaType};base64,${bytes.toString('base64')}` }
+    loaded.mediaType && /^image\/[a-z0-9.+-]+$/i.test(loaded.mediaType)
+      ? loaded.mediaType.toLowerCase()
+      : (MIME_BY_EXT[extname(attachmentName).toLowerCase()] ?? 'image/png')
+  const base64 = Buffer.from(loaded.data).toString('base64')
+  return { mediaType, base64, bytes: loaded.data.byteLength, dataUrl: `data:${mediaType};base64,${base64}` }
 }
 
 function textOf(blocks: ContentBlock[]): string {
@@ -156,21 +169,22 @@ export function repairToolPairing(messages: HarnessMessage[]): NormalizedMessage
 // ── Chat Completions wire ───────────────────────────────────────────────────
 
 type ChatMessage = Record<string, unknown>
+type ImageMap = Map<string, ResolvedImage>
 
-function chatContent(message: NormalizedMessage, resolver: ImageResolver): string | Record<string, unknown>[] {
-  const images = message.blocks.filter((b): b is ImageBlock => b.type === 'image')
+function chatContent(message: NormalizedMessage, images: ImageMap): string | Record<string, unknown>[] {
+  const imageBlocks = message.blocks.filter((b): b is ImageBlock => b.type === 'image')
   const text = textOf(message.blocks)
-  if (images.length === 0) return text
+  if (imageBlocks.length === 0) return text
   const parts: Record<string, unknown>[] = []
   if (text) parts.push({ type: 'text', text })
-  for (const image of images) {
-    const resolved = resolveImage(image, resolver)
-    parts.push({ type: 'image_url', image_url: { url: resolved.dataUrl } })
+  for (const image of imageBlocks) {
+    const resolved = images.get(image.attachment.attachmentId)
+    if (resolved) parts.push({ type: 'image_url', image_url: { url: resolved.dataUrl } })
   }
   return parts
 }
 
-function toChatMessages(history: NormalizedMessage[], systemPrompt: string, resolver: ImageResolver): ChatMessage[] {
+function toChatMessages(history: NormalizedMessage[], systemPrompt: string, images: ImageMap): ChatMessage[] {
   const out: ChatMessage[] = []
   if (systemPrompt) out.push({ role: 'system', content: systemPrompt })
 
@@ -181,7 +195,7 @@ function toChatMessages(history: NormalizedMessage[], systemPrompt: string, reso
       continue
     }
     if (message.role === 'user') {
-      out.push({ role: 'user', content: chatContent(message, resolver) })
+      out.push({ role: 'user', content: chatContent(message, images) })
       continue
     }
     if (message.role === 'assistant') {
@@ -221,30 +235,30 @@ function chatTools(tools: ToolSchema[]): Record<string, unknown>[] {
 
 type ResponsesItem = Record<string, unknown>
 
-function responsesContent(message: NormalizedMessage, resolver: ImageResolver, role: 'user' | 'assistant'): Record<string, unknown>[] {
+function responsesContent(message: NormalizedMessage, images: ImageMap, role: 'user' | 'assistant'): Record<string, unknown>[] {
   const textType = role === 'user' ? 'input_text' : 'output_text'
   const parts: Record<string, unknown>[] = []
   const text = textOf(message.blocks)
   if (text) parts.push({ type: textType, text })
   if (role === 'user') {
     for (const image of message.blocks.filter((b): b is ImageBlock => b.type === 'image')) {
-      const resolved = resolveImage(image, resolver)
-      parts.push({ type: 'input_image', image_url: resolved.dataUrl })
+      const resolved = images.get(image.attachment.attachmentId)
+      if (resolved) parts.push({ type: 'input_image', image_url: resolved.dataUrl })
     }
   }
   return parts
 }
 
-function toResponsesInput(history: NormalizedMessage[], resolver: ImageResolver): ResponsesItem[] {
+function toResponsesInput(history: NormalizedMessage[], images: ImageMap): ResponsesItem[] {
   const input: ResponsesItem[] = []
   for (const message of history) {
     if (message.role === 'system' || message.role === 'developer') continue // folded into instructions
     if (message.role === 'user') {
-      input.push({ type: 'message', role: 'user', content: responsesContent(message, resolver, 'user') })
+      input.push({ type: 'message', role: 'user', content: responsesContent(message, images, 'user') })
       continue
     }
     if (message.role === 'assistant') {
-      const content = responsesContent(message, resolver, 'assistant')
+      const content = responsesContent(message, images, 'assistant')
       if (content.length > 0) input.push({ type: 'message', role: 'assistant', content })
       const reasoning = reasoningOf(message.blocks)
       if (reasoning?.text) {
@@ -283,16 +297,18 @@ function responsesTools(tools: ToolSchema[]): Record<string, unknown>[] {
 
 type AnthropicBlock = Record<string, unknown>
 
-function anthropicContent(message: NormalizedMessage, resolver: ImageResolver): AnthropicBlock[] {
+function anthropicContent(message: NormalizedMessage, images: ImageMap): AnthropicBlock[] {
   const blocks: AnthropicBlock[] = []
   for (const block of message.blocks) {
     if (block.type === 'text' && block.text) blocks.push({ type: 'text', text: block.text })
     else if (block.type === 'image') {
-      const resolved = resolveImage(block, resolver)
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: resolved.mediaType, data: resolved.dataUrl.split(',', 2)[1] },
-      })
+      const resolved = images.get(block.attachment.attachmentId)
+      if (resolved) {
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', media_type: resolved.mediaType, data: resolved.base64 },
+        })
+      }
     } else if (block.type === 'tool-call') {
       let input: unknown = {}
       try {
@@ -312,12 +328,12 @@ function anthropicContent(message: NormalizedMessage, resolver: ImageResolver): 
   return blocks
 }
 
-function toAnthropicMessages(history: NormalizedMessage[], resolver: ImageResolver): Record<string, unknown>[] {
+function toAnthropicMessages(history: NormalizedMessage[], images: ImageMap): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = []
   for (const message of history) {
     if (message.role === 'system' || message.role === 'developer') continue
     if (message.role === 'user' || message.role === 'assistant') {
-      const content = anthropicContent(message, resolver)
+      const content = anthropicContent(message, images)
       if (content.length > 0) out.push({ role: message.role, content })
       continue
     }
@@ -378,12 +394,118 @@ export function hasImageBlocks(messages: HarnessMessage[]): boolean {
   return messages.some((m) => m.content.some((b) => b.type === 'image'))
 }
 
+/** Host-exact base64 encoded length (mirrors dsh-llm `base64Length`). */
+function base64Length(bytes: number): number {
+  return Math.ceil(bytes / 3) * 4
+}
+
+/**
+ * Number of oldest retained image occurrences whose removal brings the
+ * base64 representation back within `maxBytes`. Ports the dsh-llm
+ * `offloadedImagePrefixCount` algorithm (byte budget, quantum 1): the host
+ * compaction drops exactly this many leading occurrences and retries.
+ */
+function offloadPrefixCount(encodedLengths: number[], maxBytes: number): number {
+  const total = encodedLengths.reduce((sum, length) => sum + length, 0)
+  const excess = Math.max(0, total - maxBytes)
+  if (excess === 0) return 0
+  let count = 0
+  let removedBytes = 0
+  for (const length of encodedLengths) {
+    if (removedBytes >= excess) break
+    removedBytes += length
+    count += 1
+  }
+  return count
+}
+
+/**
+ * Load every distinct image attachment once, enforcing both the per-image
+ * ceiling and the combined request budget. The map is keyed by attachment id
+ * so repeated occurrences of the same image share one load, while budget
+ * math counts occurrences (the host offloads the oldest occurrences first,
+ * and a repeated image occupies the request each time it appears).
+ *
+ * Every rejection carries the `offloadImages` count the host compaction
+ * layer needs to converge in one retry round, mirroring the reference
+ * adapter's IMAGE_OFFLOAD_REQUIRED handling.
+ */
+async function preloadImages(
+  messages: HarnessMessage[],
+  source: ImageSource,
+  signal: AbortSignal | undefined,
+): Promise<ImageMap> {
+  const occurrences: ImageBlock[] = []
+  const unique = new Map<string, ImageBlock>()
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type !== 'image') continue
+      occurrences.push(block)
+      if (!unique.has(block.attachment.attachmentId)) {
+        unique.set(block.attachment.attachmentId, block)
+      }
+    }
+  }
+  if (occurrences.length === 0) return new Map()
+
+  const loaded = new Map<string, ResolvedImage>()
+  // A missing, unreadable, oversize or already-offloaded attachment cannot be
+  // embedded; remember the first one so its earliest occurrence sets the count.
+  let firstFailureId: string | undefined
+  for (const [id, block] of unique) {
+    try {
+      loaded.set(id, await resolveImage(block, source, signal))
+    } catch (error) {
+      if (error instanceof GatewayFailure && error.code === CODE.OFFLOAD) {
+        firstFailureId ??= id
+        continue
+      }
+      throw error
+    }
+  }
+
+  if (firstFailureId !== undefined) {
+    const earliest = occurrences.findIndex((block) => block.attachment.attachmentId === firstFailureId)
+    throw new GatewayFailure(
+      'An image attachment cannot be embedded; the host must offload the oldest occurrences.',
+      CODE.OFFLOAD,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      earliest + 1,
+    )
+  }
+
+  // Encoded length per occurrence, matching the bytes actually placed in the
+  // wire body; attachment metadata is only a fallback for defensive sizing.
+  const encodedLengths = occurrences.map((block) => {
+    const resolved = loaded.get(block.attachment.attachmentId)
+    const declared = block.attachment.bytes
+    const bytes = resolved?.bytes ?? (typeof declared === 'number' ? declared : 0)
+    return base64Length(bytes)
+  })
+  const count = offloadPrefixCount(encodedLengths, base64Length(MAX_TOTAL_IMAGE_BYTES))
+  if (count > 0) {
+    throw new GatewayFailure(
+      `Combined image attachments exceed the ${MAX_TOTAL_IMAGE_BYTES / 1024 / 1024} MB request ceiling.`,
+      CODE.OFFLOAD,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      count,
+    )
+  }
+  return loaded
+}
+
 /**
  * Build the gateway request body for one wire. Tool definitions are passed in
  * their harness shape; the fingerprint layer adds the mandatory `read`/`shell`
  * pair afterwards (see `applyFingerprint`).
  */
-export function buildRequestBody(
+export async function buildRequestBody(
   wire: WireKind,
   model: string,
   options: {
@@ -393,20 +515,22 @@ export function buildRequestBody(
     temperature?: number
     maxTokens?: number
     stop?: string[]
+    signal?: AbortSignal
   },
-  resolver: ImageResolver,
-): BuiltRequest {
+  source: ImageSource,
+): Promise<BuiltRequest> {
   const history = repairToolPairing(options.messages)
   const systemPrompt = collectSystem(options.messages, options.system)
   const tools = options.tools ?? []
   const hasImages = hasImageBlocks(options.messages)
+  const images = hasImages ? await preloadImages(options.messages, source, options.signal) : new Map<string, ResolvedImage>()
   const stop = Array.isArray(options.stop) ? options.stop.filter((s) => typeof s === 'string' && s.length > 0) : []
   const temperature = typeof options.temperature === 'number' && Number.isFinite(options.temperature) ? options.temperature : undefined
 
   if (wire === 'chat') {
     const body: Record<string, unknown> = {
       model,
-      messages: toChatMessages(history, systemPrompt, resolver),
+      messages: toChatMessages(history, systemPrompt, images),
       stream: true,
     }
     if (tools.length > 0) body.tools = chatTools(tools)
@@ -419,7 +543,7 @@ export function buildRequestBody(
   if (wire === 'responses') {
     const body: Record<string, unknown> = {
       model,
-      input: toResponsesInput(history, resolver),
+      input: toResponsesInput(history, images),
       instructions: systemPrompt || undefined,
       stream: true,
       tool_choice: 'auto',
@@ -433,7 +557,7 @@ export function buildRequestBody(
 
   const body: Record<string, unknown> = {
     model,
-    messages: toAnthropicMessages(history, resolver),
+    messages: toAnthropicMessages(history, images),
     system: systemPrompt || undefined,
     max_tokens: options.maxTokens && options.maxTokens > 0 ? options.maxTokens : 4096,
     stream: true,

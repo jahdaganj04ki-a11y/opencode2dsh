@@ -162,3 +162,83 @@ test('when the live fetch never succeeds, listModels still answers from the stat
   assert.ok(models.length > 0)
   assert.ok(models.every((m) => m.provider === 'opencode-free'))
 })
+
+test('conditional refresh sends If-None-Match and a 304 keeps the roster without re-announcing', async () => {
+  const requestHeaders: RequestInit['headers'][] = []
+  let phase: 'initial' | 'revalidate' = 'initial'
+  mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    requestHeaders.push(init?.headers)
+    if (phase === 'revalidate') {
+      return new Response(null, { status: 304, headers: { etag: '"v2-etag"' } })
+    }
+    return new Response(JSON.stringify({ data: liveIds.map((id) => ({ id })) }), {
+      status: 200,
+      headers: { 'content-type': 'application/json', etag: '"v1-etag"' },
+    })
+  })
+
+  let announcements = 0
+  const catalog = track(makeCatalog(() => { announcements += 1 }))
+  catalog.start()
+  await catalog.warm(3000)
+  const before = catalog.eligibleIds()
+  assert.ok(before.length > 0)
+  const announcedAfterFirst = announcements
+
+  // Second refresh must carry the stored ETag and accept a 304 as success.
+  phase = 'revalidate'
+  await catalog.refresh()
+  const lastHeaders = new Headers(requestHeaders.at(-1))
+  assert.equal(lastHeaders.get('if-none-match'), '"v1-etag"')
+  assert.deepEqual(catalog.eligibleIds(), before)
+  assert.equal(announcements, announcedAfterFirst, '304 must not re-announce an unchanged roster')
+})
+
+test('the ETag survives a disk-cache restart and is re-sent by the next catalog instance', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = mkdtempSync(join(tmpdir(), 'opencode2dsh-etag-'))
+
+  try {
+    mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) =>
+      new Response(JSON.stringify({ data: liveIds.map((id) => ({ id })) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', etag: '"persisted-etag"' },
+      }),
+    )
+    const first = new ModelCatalog(
+      resolveConfig({ diskCache: true, warmMs: 2000, dataDir: dir }),
+      new JsonStore(dir),
+      silentLogger,
+      undefined,
+      Date.now,
+      { retrySchedule: [5, 10, 20], unrefTimers: false },
+    )
+    track(first)
+    first.start()
+    await first.warm(3000)
+    first.dispose()
+
+    const seen: string[] = []
+    mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+      seen.push(new Headers(init?.headers).get('if-none-match') ?? '(none)')
+      return new Response(null, { status: 304, headers: { etag: '"persisted-etag"' } })
+    })
+    const second = new ModelCatalog(
+      resolveConfig({ diskCache: true, warmMs: 2000, dataDir: dir }),
+      new JsonStore(dir),
+      silentLogger,
+      undefined,
+      Date.now,
+      { retrySchedule: [5, 10, 20], unrefTimers: false },
+    )
+    track(second)
+    second.start()
+    await second.warm(3000)
+    assert.deepEqual(seen.filter((value) => value !== '(none)'), ['"persisted-etag"'])
+    assert.deepEqual(second.eligibleIds(), first.eligibleIds())
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

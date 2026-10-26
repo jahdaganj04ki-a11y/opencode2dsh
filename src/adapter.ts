@@ -15,7 +15,7 @@
  *    usage chunk when the gateway reported one.
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { capabilitiesFor, baseModelId } from './capabilities.js'
 import { resolveConfig, type PluginConfig, type ResolvedConfig } from './config.js'
@@ -30,7 +30,8 @@ import {
   estimateTokens,
   hasImageBlocks,
   MAX_IMAGE_BYTES,
-  type ImageResolver,
+  type ImageSource,
+  type LoadedImage,
 } from './messages.js'
 import { applyEffort, defaultEffortId, effortMenu } from './effort.js'
 import { createBlockSink, feedStream, type BlockSink, type StreamResult } from './stream.js'
@@ -57,6 +58,8 @@ import type {
 
 const PROVIDER_NAME = 'OpenCode Free'
 const MIN_CONTINUATION_BUDGET = 1024
+const CONTINUATION_PROMPT =
+  'Continue your previous answer exactly where it stopped. Do not repeat anything you already wrote, and do not call any tools.'
 
 /**
  * Host-level retries are disabled on purpose: the turn engine below already
@@ -71,44 +74,141 @@ const PROVIDER_RETRY_POLICY: ProviderRetryPolicy = Object.freeze({
   retryableCodes: Object.freeze([]),
   backoff: Object.freeze({ initialDelayMs: 500, maxDelayMs: 10_000, jitterRatio: 0.1 }),
 })
-const CONTINUATION_PROMPT =
-  'Continue your previous answer exactly where it stopped. Do not repeat anything you already wrote, and do not call any tools.'
-const ATTACHMENT_SERVICE_TOKENS = ['attachment', 'dsh-attachment-local', 'dsh-attachment', 'attachment-local']
 
 /** Error with the host LlmFailure shape, thrown without importing host classes. */
 export class LlmFailureError extends Error implements LlmFailure {
+  /**
+   * The host's `normalizeLlmFailure` only preserves a foreign adapter's code
+   * through an own data property named `failure`; a plain `.code` on a
+   * non-HarnessError would otherwise be flattened to `UNKNOWN`. The payload
+   * here passes the host's own validation (status 100–599, positive
+   * retry-after, non-empty request id).
+   */
+  readonly failure: LlmFailure
+
   constructor(
     message: string,
     readonly code: string,
     readonly status?: number,
     readonly providerRetryAfterMs?: number,
     readonly requestId?: string,
+    offloadImages?: number,
   ) {
     super(message)
     this.name = 'LlmFailureError'
+    const payload: LlmFailure = { message, code }
+    if (typeof status === 'number') payload.status = status
+    if (typeof providerRetryAfterMs === 'number' && providerRetryAfterMs > 0) {
+      payload.providerRetryAfterMs = providerRetryAfterMs
+    }
+    if (typeof requestId === 'string' && requestId.length > 0) payload.requestId = requestId
+    if (typeof offloadImages === 'number' && Number.isSafeInteger(offloadImages) && offloadImages > 0) {
+      payload.offloadImages = offloadImages
+    }
+    this.failure = Object.freeze(payload)
   }
 }
 
-class AttachmentResolver implements ImageResolver {
+interface RequestImageAttachmentLike {
+  data: Uint8Array
+  mediaType: string
+}
+
+interface AttachmentServiceFull extends AttachmentService {
+  /** Host-side encoder: returns a request-ready, possibly downscaled image. */
+  readImageRequest?(ref: ImageAttachmentRef, target: ImageRequestTargetInfo, signal?: AbortSignal): Promise<RequestImageAttachmentLike>
+}
+
+interface FsService {
+  /** Map a host filesystem path into the current execution world. */
+  processPathFromHostPath?(hostPath: string): string | undefined
+}
+
+/**
+ * Three-tier image loading, mirroring how the shipped dsh-llm-pi-ai adapter
+ * reaches attachments on this exact host version:
+ *   1. the `attachments` service's `readImageRequest` (encoder/quality ladder,
+ *      honors the byte target declared by `imageRequestTarget`);
+ *   2. `imageHostPath` + the `fs` service's host→execution path mapping, then
+ *      a direct bounded read;
+ *   3. the on-disk `$DSH_HOME/attachments/v1/objects/<xx>/<sha>` convention.
+ * Undefined means "not resolvable", which the message builder turns into the
+ * host's IMAGE_OFFLOAD_REQUIRED flow instead of failing the whole turn hard.
+ */
+class AttachmentImageSource implements ImageSource {
   constructor(private readonly ctx: PluginContext) {}
 
-  hostPath(ref: ImageAttachmentRef): string | undefined {
-    for (const token of ATTACHMENT_SERVICE_TOKENS) {
+  private attachments(): AttachmentServiceFull | undefined {
+    try {
+      return this.ctx.get?.('attachments') as AttachmentServiceFull | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private fs(): FsService | undefined {
+    try {
+      return this.ctx.get?.('fs') as FsService | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  async load(ref: ImageAttachmentRef, signal?: AbortSignal): Promise<LoadedImage | undefined> {
+    const service = this.attachments()
+
+    // Tier 1: host-encoded request version (already bounded to the target).
+    if (service?.readImageRequest) {
       try {
-        const service = this.ctx.get?.(token) as AttachmentService | undefined
-        const path = service?.imageHostPath?.(ref)
-        if (path) return path
-      } catch {
-        // A missing Cordis service token throws; try the next one.
+        const target: ImageRequestTargetInfo = {
+          width: typeof ref.width === 'number' ? ref.width : 0,
+          height: typeof ref.height === 'number' ? ref.height : 0,
+          maxBytes: MAX_IMAGE_BYTES,
+        }
+        const encoded = await service.readImageRequest(ref, target, signal)
+        if (encoded?.data) {
+          return {
+            mediaType: encoded.mediaType ?? ref.mediaType ?? 'image/png',
+            data: encoded.data,
+          }
+        }
+      } catch (error) {
+        // Fall through to path-based reads; a broken encoder must not kill vision.
+        this.ctx.logger.warn?.('[opencode2dsh] attachments.readImageRequest failed, using path fallback', error)
       }
     }
-    // Filesystem convention: $DSH_HOME/attachments/v1/objects/<xx>/<sha>
+
+    // Tier 2: host path → execution-world path → direct read.
+    let hostPath: string | undefined
+    try {
+      hostPath = service?.imageHostPath?.(ref)
+    } catch {
+      hostPath = undefined
+    }
+    if (hostPath) {
+      const executionPath = this.fs()?.processPathFromHostPath?.(hostPath) ?? hostPath
+      const bytes = this.tryRead(executionPath)
+      if (bytes) return { mediaType: ref.mediaType ?? 'image/png', data: bytes }
+    }
+
+    // Tier 3: content-addressed storage convention.
     const id = ref?.attachmentId
     if (typeof id === 'string' && /^[a-f0-9]{16,}$/i.test(id)) {
       const candidate = join(resolveDshHome(), 'attachments', 'v1', 'objects', id.slice(0, 2), id)
-      if (existsSync(candidate)) return candidate
+      const bytes = this.tryRead(candidate)
+      if (bytes) return { mediaType: ref.mediaType ?? 'image/png', data: bytes }
     }
     return undefined
+  }
+
+  private tryRead(path: string | undefined): Uint8Array | undefined {
+    if (!path) return undefined
+    try {
+      if (!existsSync(path)) return undefined
+      return readFileSync(path)
+    } catch {
+      return undefined
+    }
   }
 }
 
@@ -121,7 +221,14 @@ function pathForWire(wire: 'chat' | 'responses' | 'messages'): string {
 function toLlmFailure(error: unknown): LlmFailureError {
   if (error instanceof LlmFailureError) return error
   if (error instanceof GatewayFailure) {
-    return new LlmFailureError(error.message, error.code, error.status, error.providerRetryAfterMs, error.requestId)
+    return new LlmFailureError(
+      error.message,
+      error.code,
+      error.status,
+      error.providerRetryAfterMs,
+      error.requestId,
+      error.offloadImages,
+    )
   }
   if (error instanceof StreamTimeout) {
     return new LlmFailureError(error.message, CODE.TIMEOUT)
@@ -176,7 +283,7 @@ export interface AdapterDeps {
 export class OpenCodeFreeAdapter {
   private readonly config: ResolvedConfig
   private readonly catalog: ModelCatalog
-  private readonly resolver: ImageResolver
+  private readonly imageSource: ImageSource
   private readonly metrics = new TurnMetrics()
   private readonly logger: Logger
 
@@ -188,11 +295,13 @@ export class OpenCodeFreeAdapter {
       metrics: () => this.metrics.snapshot(),
     })
     this.catalog.start()
-    this.resolver = new AttachmentResolver(deps.ctx)
+    this.imageSource = new AttachmentImageSource(deps.ctx)
     deps.ctx.effect?.(() => () => this.catalog.dispose())
   }
 
-  providerInfo(): { id: string; name: string } {
+  // The host calls every method with the provider route as its first
+  // argument; signatures mirror LlmAdapter (dsh-llm 0.2.1-rc.2) exactly.
+  providerInfo(_provider?: string): { id: string; name: string } {
     return { id: this.config.providerId, name: PROVIDER_NAME }
   }
 
@@ -218,11 +327,11 @@ export class OpenCodeFreeAdapter {
     return { width, height, maxBytes: Math.min(bytes, MAX_IMAGE_BYTES) }
   }
 
-  async listModels(): Promise<ModelInfo[]> {
+  async listModels(_provider?: string): Promise<ModelInfo[]> {
     return this.catalog.listModels(this.config.providerId)
   }
 
-  resolveModel(model: string): ResolvedModelInfo {
+  resolveModel(_provider: string, model: string, _signal?: AbortSignal): ResolvedModelInfo {
     const cap = capabilitiesFor(baseModelId(model))
     const info: ResolvedModelInfo = {
       provider: this.config.providerId,
@@ -241,16 +350,54 @@ export class OpenCodeFreeAdapter {
     return info
   }
 
-  prepareCall(options: GenerateOptions): { model: string; stream: (options: GenerateOptions) => AsyncGenerator<StreamChunk> } {
+  /**
+   * Host contract: `prepareCall(provider, model, signal)` binds one adapter
+   * generation and returns the resolved model info plus a one-shot stream
+   * entry point. The host dispatches the fully assembled GenerateOptions via
+   * `stream(options)` later.
+   */
+  async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
+    model: ResolvedModelInfo
+    stream: (options: GenerateOptions) => AsyncIterable<StreamChunk>
+  }> {
     return {
-      model: baseModelId(options.model),
+      model: this.resolveModel(provider, model, signal),
       stream: (callOptions) => this.stream(callOptions),
     }
   }
 
   // ── Turn engine ───────────────────────────────────────────────────────────
 
-  async *stream(options: GenerateOptions): AsyncGenerator<StreamChunk> {
+  stream(options: GenerateOptions): AsyncIterableIterator<StreamChunk> {
+    // An internal controller covers the path the host's signal does not:
+    // when a consumer stops iterating early, the host runtime closes the
+    // iterator without necessarily aborting the external signal. The inner
+    // generator parks on an await that only settles when the turn emits, so a
+    // bare generator.return() would queue behind that await and leave the
+    // gateway request running until a watchdog fires. Aborting the internal
+    // controller first makes the in-flight turn reject immediately, which
+    // unblocks the parked generator so its own finally can close cleanly.
+    const internal = new AbortController()
+    const generator = this.streamTurns(options, internal)
+    return {
+      [Symbol.asyncIterator](): AsyncIterableIterator<StreamChunk> {
+        return this
+      },
+      next: (value?: unknown): Promise<IteratorResult<StreamChunk>> => generator.next(value),
+      return: (value?: unknown): Promise<IteratorResult<StreamChunk>> => {
+        internal.abort()
+        return generator.return(value)
+      },
+      throw: (error?: unknown): Promise<IteratorResult<StreamChunk>> => generator.throw(error),
+    }
+  }
+
+  private async *streamTurns(options: GenerateOptions, internal: AbortController): AsyncGenerator<StreamChunk> {
+    const linkedSignal = options.signal
+      ? AbortSignal.any([options.signal, internal.signal])
+      : internal.signal
+    const callOptions: GenerateOptions = { ...options, signal: linkedSignal }
+
     const queue: StreamChunk[] = []
     let wake: (() => void) | undefined
     let parked = new Promise<void>((resolve) => {
@@ -264,7 +411,7 @@ export class OpenCodeFreeAdapter {
       wake?.()
     }
 
-    const turn = this.runTurn(options, emit).then(
+    const turn = this.runTurn(callOptions, emit).then(
       () => {
         settled = true
         wake?.()
@@ -302,6 +449,9 @@ export class OpenCodeFreeAdapter {
       }
       while (queue.length > 0) yield queue.shift() as StreamChunk
     } finally {
+      // Normal completion, thrown failure, or early iterator.close() all land
+      // here; abort is idempotent and never touches the caller's own signal.
+      internal.abort()
       // Ensure the turn promise cannot create an unhandled rejection.
       await turn.catch(() => undefined)
     }
@@ -328,7 +478,7 @@ export class OpenCodeFreeAdapter {
     let usage: TokenUsage | undefined
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const built = buildRequestBody(
+      const built = await buildRequestBody(
         cap.wire,
         base,
         {
@@ -338,8 +488,9 @@ export class OpenCodeFreeAdapter {
           temperature: current.temperature,
           maxTokens: current.maxTokens,
           stop: current.stop,
+          signal: options.signal,
         },
-        this.resolver,
+        this.imageSource,
       )
       const style = cap.wire === 'chat' ? 'chat' : cap.wire === 'messages' ? 'claude' : 'flat'
       const aliases = applyFingerprint(built.body, style)

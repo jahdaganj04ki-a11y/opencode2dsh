@@ -10,10 +10,10 @@ Reasoning-Menü).
 
 - **Zielhost:** DSH Desktop `v0.12.1` (Windows x64), Harness
   `@deepseek-ai/dsh@0.2.1-rc.2`.
-- **Laufzeitform:** ein esbuild-Bundle (`dist/index.js`, ca. 80 KB), **keine
-  Laufzeitabhängigkeiten** und keine `@deepseek-ai/*`-Importe – der Host
-  validiert Adapter strukturell, das Bundle installiert daher sauber in die
-  gehoistete pnpm-Generation des Plugin-Managers.
+- **Laufzeitform:** ein esbuild-Bundle (`dist/index.js`, unter 100 KB),
+  **keine Laufzeitabhängigkeiten** und keine `@deepseek-ai/*`-Importe – der
+  Host validiert Adapter strukturell, das Bundle installiert daher sauber in
+  die gehoistete pnpm-Generation des Plugin-Managers.
 - **Lizenz:** MIT.
 
 > Englische Fassung: [`README.md`](./README.md).
@@ -49,20 +49,87 @@ Oktober 2026), vollständig im Prozess:
 
 ---
 
-## Installation
+## Installation unter Windows x64 (DSH Desktop v0.12.1)
 
-### Aus einem Tarball (empfohlen unter Windows)
+Es genügt eine Datei: das gepackte Plugin **`opencode2dsh-0.1.0.tgz`**. Es
+wird aus dem Quelltext erzeugt (Node.js ≥ 20.19) oder über die
+Release-Artefakte bezogen:
 
 ```powershell
+npm ci
 npm run build
 npm pack
-# erzeugt opencode2dsh-0.1.0.tgz – neben DSH Desktop kopieren, dann:
+# -> opencode2dsh-0.1.0.tgz
+```
+
+Geladen wird das `web`-Profil des DSH Desktop. Es gibt zwei Wege dorthin;
+beide überlassen die Profil-Änderung dem Host-Plugin-Manager.
+
+### Weg A – über die Plugin-Seite in der App (ohne Terminal)
+
+1. In DSH Desktop in der Seitenleiste die Seite **Plugins** öffnen (in
+   manchen Builds heißt der Eintrag *Workbench-Verwaltung → Installiert*).
+2. Die Aktion für die lokale Paketinstallation wählen und
+   `opencode2dsh-0.1.0.tgz` auswählen. Ob der ausgelieferte Build einen
+   Datei-Picker für lokale `.tgz` anbietet, entscheidet die App selbst; gibt
+   es diesen Eintrag nicht, führt Weg B zum Ziel.
+3. Den Installer abschließen und DSH Desktop dann **vollständig beenden und
+   neu starten** (Fenster schließen alone genügt nicht).
+
+### Weg B – über die `dsh`-CLI (funktioniert auch ohne Datei-Picker)
+
+In der PowerShell, im Ordner mit dem Tarball:
+
+```powershell
 dsh plugin --profile web add .\opencode2dsh-0.1.0.tgz
 ```
 
-DSH Desktop neu starten. Im Modell-Picker erscheint der Provider
-**OpenCode Free**. Entfernen:
-`dsh plugin --profile web remove opencode2dsh`.
+`--profile web` steht – wie beim Aufruf durch den Host-Plugin-Manager selbst
+– zwischen `plugin` und der Operation. Falls `dsh` nicht im `PATH` liegt: das
+Kommando im mitgelieferten Terminal von DSH Desktop ausführen oder die
+genaue Syntax des eigenen Builds mit `dsh plugin add --help` prüfen; ein
+Tarball-Pfad oder eine `file:`-URL ist ein akzeptierter Installationsspec.
+Anschließend DSH Desktop vollständig beenden und neu starten.
+
+### Prüfen, ob das Plugin live ist
+
+1. Der Neustart läuft ohne Safe-Mode-/Plugin-Fehler-Hinweis durch.
+2. Im Modell-Picker erscheint der Provider **OpenCode Free** mit der
+   aktuellen kostenlosen Modellliste – sie wird bei jedem Programmstart frisch
+   vom Gateway geladen.
+3. Optionaler CLI-Nachweis, dass das Profil die Ebene geladen hat:
+
+   ```powershell
+   dsh --profile web --dump-config | findstr /i opencode
+   ```
+
+Ein API-Key wird zu keinem Zeitpunkt verlangt. Bleibt der Picker leer, hilft
+die [Fehlerbehebung](#fehlerbehebung) weiter.
+
+### Deinstallation
+
+```powershell
+dsh plugin --profile web remove opencode2dsh
+```
+
+Anschließend DSH Desktop neu starten. Der eigene Cache-Ordner des Plugins
+(`<DSH_HOME>\opencode2dsh\`) bleibt erhalten und kann von Hand gelöscht
+werden.
+
+### Vom Plugin unter Windows genutzte Pfade
+
+DSH Desktop setzt `DSH_HOME` für den Harness-Prozess; bei einer
+Standardinstallation liegt es unter:
+
+```
+%APPDATA%\dsh-desktop\harness
+```
+
+- Web-Profil (Manifest, `node_modules`, `cordis.patch.yml`):
+  `%APPDATA%\dsh-desktop\harness\profiles\web`
+- Eigener Zustand dieses Plugins (`catalog-cache.json`,
+  `adapter-status.json`):
+  `%APPDATA%\dsh-desktop\harness\opencode2dsh`
 
 ### Über den Plugin-Markt / Paketnamen
 
@@ -77,8 +144,8 @@ angewandt.
 Der DSH-Plugin-Manager staget das Paket in einer Content-Hash-Generation unter
 `$DSH_HOME/profiles/.generations/live/` mit `node-linker=hoisted`, entfernt
 React-/`@deepseek-ai/*`-Singletons und fügt die Cordis-Zeile ein. Dieses
-Plugin hat keine Installskripte und keine Laufzeitabhängigkeiten – die
-Generation enthält nur das Bundle.
+Plugin hat keine Installskripte und keine Laufzeitabhängigkeiten (das Bundle
+importiert nur Node-Builtins) – die Generation enthält nur das eine Bundle.
 
 ---
 
@@ -212,10 +279,17 @@ den Provider:
 
 ### An den Harness gemeldete Fehler
 
-`LANE_LOCKED` (Free-Tier-Gate), `REGION_BLOCKED`, `QUOTA_EXCEEDED` (mit
-Retry-After), `UNKNOWN_MODEL`, `CONTEXT_WINDOW_EXCEEDED`,
-`IMAGE_OFFLOAD_REQUIRED`, `UNSUPPORTED_CONTENT`, `INVALID_CREDENTIAL`,
-`EMPTY_RESPONSE`, `STREAM_CLOSED`, `STREAM_TIMEOUT`, `ABORTED`.
+Die Codes an der Adaptergrenze folgen der kanonischen Taxonomie des Hosts:
+`QUOTA` (mit Retry-After), `UNKNOWN_MODEL`, `CONTEXT_WINDOW_EXCEEDED`,
+`IMAGE_OFFLOAD_REQUIRED` (mit dem Host-kompatiblen Zähler
+`offloadImages`), `UNSUPPORTED_CONTENT`, `INVALID_CONFIG`,
+`INVALID_CREDENTIAL`, `SERVER`, `EMPTY_RESPONSE`, `STREAM_CLOSED`,
+`TIMEOUT`, `ABORTED` sowie die Free-Lane-spezifischen Klassifizierungen
+`LANE_LOCKED` (Fingerprint-Gate), `REGION_BLOCKED` und
+`HTML_INTERSTITIAL`. Der Adapter meldet `maxRetries: 0`, damit die
+Retry-Wasserfallkette des Hosts keine Free-Lane-Runde wiederholt; der
+einzige interne Wiederholungsversuch des Plugins greift nur bei
+Transportfehlern vor der ersten Ausgabe.
 
 ---
 
@@ -245,7 +319,7 @@ abgelehnt wird. Es nutzt exakt die ausgelieferten Module
 | Jedes Modell liefert Free-Tier-/`LANE_LOCKED`-Fehler | Der Gateway-Fingerprint wurde upstream geändert oder das Netzwerk schreibt TLS/UA um. `adapter-status.json` prüfen, `npm run smoke` ausführen, Plugin aktualisieren. |
 | Gelegentlich 403/429, auch bei offiziellen Clients | Bekannte Gateway-Instabilität und sitzungsbezogenes Freikontingent. Das Plugin meldet ehrlich und beachtet `Retry-After`; eine neue Harness-Konversation erzeugt eine frische Upstream-Sitzung. |
 | Regionsmeldung | Die Free-Lane lehnt manche Regionen an der Kontokante ab; clientseitig nicht änderbar. |
-| Bildnachricht verlangt Auslagerung | Anhang über 8 MB, bereits ausgelagert oder ohne Host-Pfad. Der Host-Offload-Fluss greift automatisch. |
+| Bildnachricht verlangt Auslagerung | Ein Anhang überschreitet das 8-MB-Pro-Bild-Limit, das gemeinsame 16-MB-Request-Limit, ist bereits ausgelagert oder hat keinen Host-Pfad. Der Fehler nennt die exakte Anzahl `offloadImages`; der Host-Offload-Fluss verwirft so viele der ältesten Vorkommen und wiederholt automatisch. |
 | Empty response / stream closed | Das Gateway beendete ohne Inhalt (`EMPTY_RESPONSE`) oder ohne Terminal-Ereignis (`STREAM_CLOSED`). Retrybare Transportfehler werden automatisch einmal wiederholt. |
 | Picker zeigt nach dem Start das Static-Roster | Das Live-Listing war nicht innerhalb `warmMs` erreichbar; der Startup-Backoff wiederholt die Abrufe (maximal alle 30 s), und sobald eine Live-Antwort eintrifft, aktualisiert sich der Picker von selbst. Bei späteren Starts dient der Festplatten-Cache bis zum ersten Frisch-Abruf. |
 

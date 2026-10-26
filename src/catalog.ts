@@ -23,7 +23,7 @@
  *    blocks on a slow gateway and is corrected by the announcement afterwards.
  */
 
-import { fetchJson, GatewayFailure, CODE } from './http.js'
+import { fetchJsonConditional, GatewayFailure, CODE } from './http.js'
 import { blockReason, isFreeId, capabilitiesFor, displayName } from './capabilities.js'
 import {
   CATALOG_CACHE_FILE,
@@ -85,6 +85,7 @@ export class ModelCatalog {
   private started = false
   private disposed = false
   private publishedSignature: string | undefined
+  private etag: string | undefined
   private readonly retrySchedule: number[]
   private readonly unrefTimers: boolean
   private readonly metricsProvider?: () => unknown
@@ -173,6 +174,7 @@ export class ModelCatalog {
     const cached = this.store.read<CachedCatalog>(CATALOG_CACHE_FILE)
     if (cached && Array.isArray(cached.ids) && this.now() - cached.at < CATALOG_CACHE_TTL_MS) {
       this.ids = [...new Set(cached.ids)]
+      this.etag = typeof cached.etag === 'string' ? cached.etag : undefined
       this.state = 'stale'
       this.writeHealth('cache')
     } else {
@@ -207,8 +209,25 @@ export class ModelCatalog {
   private async doRefresh(): Promise<void> {
     const url = `${this.config.baseUrl}/inference/v1/models`
     try {
-      const envelope = await fetchJson<ListingEnvelope>(url, { timeoutMs: this.config.listTimeoutMs })
-      const rows = envelope.data ?? envelope.models ?? []
+      const result = await fetchJsonConditional<ListingEnvelope>(url, this.etag, {
+        timeoutMs: this.config.listTimeoutMs,
+      })
+      // Gateway confirms the cached representation: keep everything, just
+      // re-stamp the cache so the 7-day TTL never expires behind a 304.
+      if (result.unchanged) {
+        this.hasLive = true
+        this.state = 'ready'
+        this.lastError = undefined
+        if (result.etag) this.etag = result.etag
+        if (this.config.diskCache) {
+          this.store.write(CATALOG_CACHE_FILE, { at: this.now(), ids: this.ids, ...(this.etag ? { etag: this.etag } : {}) } satisfies CachedCatalog)
+        }
+        this.writeHealth('live')
+        return
+      }
+      const envelope = result.body
+      if (result.etag) this.etag = result.etag
+      const rows = envelope?.data ?? envelope?.models ?? []
       // De-duplicate defensively: the host rejects a catalog with repeated
       // ids (INVALID_CATALOG), so never let a quirky listing through as-is.
       const ids = [...new Set(
@@ -233,7 +252,11 @@ export class ModelCatalog {
       this.state = 'ready'
       this.lastError = undefined
       if (this.config.diskCache) {
-        this.store.write(CATALOG_CACHE_FILE, { at: this.now(), ids } satisfies CachedCatalog)
+        this.store.write(CATALOG_CACHE_FILE, {
+          at: this.now(),
+          ids,
+          ...(this.etag ? { etag: this.etag } : {}),
+        } satisfies CachedCatalog)
       }
       this.writeHealth('live')
       this.announceIfChanged()
@@ -329,7 +352,7 @@ export class ModelCatalog {
 
 /** Minimal listing fetch used by the standalone smoke script. */
 export async function fetchListing(baseUrl: string): Promise<string[]> {
-  const envelope = await fetchJson<ListingEnvelope>(`${baseUrl}/inference/v1/models`, { timeoutMs: 30_000 })
-  const rows = envelope.data ?? envelope.models ?? []
+  const result = await fetchJsonConditional<ListingEnvelope>(`${baseUrl}/inference/v1/models`, undefined, { timeoutMs: 30_000 })
+  const rows = result.body?.data ?? result.body?.models ?? []
   return [...new Set(rows.map((row) => (typeof row.id === 'string' ? row.id : '')).filter(Boolean))]
 }

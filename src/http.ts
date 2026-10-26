@@ -28,6 +28,12 @@ export class GatewayFailure extends Error implements LlmFailure {
     readonly providerRetryAfterMs?: number,
     readonly requestId?: string,
     readonly retryable = false,
+    /**
+     * For IMAGE_OFFLOAD_REQUIRED: how many more of the oldest retained image
+     * occurrences the host must offload before the request fits. Mirrors the
+     * host's own `requiredImageOffload` count semantics.
+     */
+    readonly offloadImages?: number,
   ) {
     super(message)
     this.name = 'GatewayFailure'
@@ -41,21 +47,25 @@ export class StreamTimeout extends Error {
   }
 }
 
-// Internal failure vocabulary. The adapter maps these onto host LlmError codes.
+// Internal failure vocabulary. Values mirror the host LlmError taxonomy
+// (dsh-llm adapter-failure): canonical codes are reused verbatim so the
+// harness UI and retry machinery understand them; the lane-specific codes
+// (LANE_LOCKED, REGION_BLOCKED, HTML_INTERSTITIAL) are valid custom strings
+// the host passes through via the adapter's own `failure` payload.
 export const CODE = {
   LANE_LOCKED: 'LANE_LOCKED',
   REGION_BLOCKED: 'REGION_BLOCKED',
-  QUOTA: 'QUOTA_EXCEEDED',
+  QUOTA: 'QUOTA',
   UNKNOWN_MODEL: 'UNKNOWN_MODEL',
   CONTEXT_TOO_LONG: 'CONTEXT_WINDOW_EXCEEDED',
   BAD_REQUEST: 'INVALID_CONFIG',
   UNAUTHORIZED: 'INVALID_CREDENTIAL',
-  UPSTREAM: 'UPSTREAM_ERROR',
+  UPSTREAM: 'SERVER',
   HTML_INTERSTITIAL: 'HTML_INTERSTITIAL',
   EMPTY: 'EMPTY_RESPONSE',
   STREAM_CLOSED: 'STREAM_CLOSED',
   ABORTED: 'ABORTED',
-  TIMEOUT: 'STREAM_TIMEOUT',
+  TIMEOUT: 'TIMEOUT',
   OFFLOAD: 'IMAGE_OFFLOAD_REQUIRED',
   UNSUPPORTED: 'UNSUPPORTED_CONTENT',
 } as const
@@ -380,4 +390,65 @@ export async function fetchJson<T>(url: string, options: FetchJsonOptions = {}):
   if (!response.ok) throw classifyFailure(response.status, text, response.headers.get('retry-after'))
   if (looksHtml(text)) throw new GatewayFailure('Gateway returned an HTML page instead of the catalog.', CODE.HTML_INTERSTITIAL, response.status)
   return JSON.parse(text) as T
+}
+
+export interface ConditionalResult<T> {
+  /** 304: the gateway confirmed the cached representation is current. */
+  unchanged: boolean
+  body?: T
+  etag?: string
+}
+
+/**
+ * Conditional GET for the catalog: sends `If-None-Match` when an ETag is
+ * known. A 304 answer costs no parse/announce work and preserves the cached
+ * roster; everything else behaves like {@link fetchJson}.
+ */
+export async function fetchJsonConditional<T>(
+  url: string,
+  etag: string | undefined,
+  options: FetchJsonOptions = {},
+): Promise<ConditionalResult<T>> {
+  const controller = new AbortController()
+  const detach = linkSignal(options.signal, controller)
+  let timedOut = false
+  const timer = options.timeoutMs
+    ? setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, options.timeoutMs)
+    : undefined
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'opencode2dsh/0.1',
+        ...(etag ? { 'if-none-match': etag } : {}),
+      },
+      signal: controller.signal,
+      redirect: 'error',
+    })
+    if (response.status === 304) return { unchanged: true, etag: response.headers.get('etag') ?? etag ?? undefined }
+    const text = await response.text()
+    if (!response.ok) throw classifyFailure(response.status, text, response.headers.get('retry-after'))
+    if (looksHtml(text)) throw new GatewayFailure('Gateway returned an HTML page instead of the catalog.', CODE.HTML_INTERSTITIAL, response.status)
+    return { unchanged: false, body: JSON.parse(text) as T, etag: response.headers.get('etag') ?? undefined }
+  } catch (error) {
+    if (timedOut) {
+      throw new GatewayFailure(`Catalog fetch timed out after ${options.timeoutMs} ms.`, CODE.UPSTREAM, undefined, undefined, undefined, true)
+    }
+    if (options.signal?.aborted) {
+      throw new GatewayFailure(options.signal.reason?.message ?? 'Request aborted.', CODE.ABORTED, undefined, undefined, undefined, false)
+    }
+    if (error instanceof GatewayFailure) throw error
+    throw new GatewayFailure(
+      error instanceof Error ? error.message : 'Network error reaching the OpenCode gateway.',
+      CODE.UPSTREAM, undefined, undefined, undefined, true,
+    )
+  } finally {
+    if (timer) clearTimeout(timer)
+    detach()
+  }
 }

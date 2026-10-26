@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { writeFileSync, mkdtempSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -8,13 +8,18 @@ import {
   estimateMessageTokens,
   repairToolPairing,
   MAX_IMAGE_BYTES,
-  type ImageResolver,
+  type ImageSource,
 } from '../src/messages.js'
 import { GatewayFailure } from '../src/http.js'
 import type { HarnessMessage, ImageAttachmentRef } from '../src/types.js'
 
-const resolver: ImageResolver = {
-  hostPath: (ref) => (ref.attachmentId === 'missing' ? undefined : join(tmpdir(), ref.attachmentId)),
+const resolver: ImageSource = {
+  load: async (ref) => {
+    if (ref.attachmentId === 'missing') return undefined
+    const path = join(tmpdir(), ref.attachmentId)
+    if (!existsSync(path)) return undefined
+    return { mediaType: ref.mediaType ?? 'image/png', data: readFileSync(path) }
+  },
 }
 
 test('repairToolPairing synthesizes missing calls and missing results', () => {
@@ -42,8 +47,8 @@ test('repairToolPairing synthesizes missing calls and missing results', () => {
   assert.equal(closing.toolCallId, 'open-1')
 })
 
-test('chat wire: system fold, tool calls and tool results serialize', () => {
-  const built = buildRequestBody(
+test('chat wire: system fold, tool calls and tool results serialize', async () => {
+  const built = await buildRequestBody(
     'chat',
     'big-pickle',
     {
@@ -73,8 +78,8 @@ test('chat wire: system fold, tool calls and tool results serialize', () => {
   assert.deepEqual(built.body.stop, ['STOP'])
 })
 
-test('responses wire: instructions, function_call items and output items', () => {
-  const built = buildRequestBody(
+test('responses wire: instructions, function_call items and output items', async () => {
+  const built = await buildRequestBody(
     'responses',
     'muse-spark-1.3-contributor-free',
     {
@@ -99,8 +104,8 @@ test('responses wire: instructions, function_call items and output items', () =>
   assert.equal(built.body.stop, undefined)
 })
 
-test('messages wire: anthropic blocks, role alternation and required max_tokens', () => {
-  const built = buildRequestBody(
+test('messages wire: anthropic blocks, role alternation and required max_tokens', async () => {
+  const built = await buildRequestBody(
     'messages',
     'union-alpha',
     {
@@ -129,40 +134,104 @@ test('messages wire: anthropic blocks, role alternation and required max_tokens'
   assert.ok(Array.isArray(built.body.tools) && (built.body.tools as unknown[]).length > 0)
 })
 
-test('images become data URLs on chat, input_image on responses, base64 source on messages', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-img-'))
-  const file = join(dir, 'pic.png')
-  writeFileSync(file, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
-  const localResolver: ImageResolver = { hostPath: () => file }
-  const ref: ImageAttachmentRef = { attachmentId: 'pic.png' }
+test('images become data URLs on chat, input_image on responses, base64 source on messages', async () => {
+  const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  const localResolver: ImageSource = {
+    load: async () => ({ mediaType: 'image/png', data: bytes }),
+  }
+  const ref: ImageAttachmentRef = { attachmentId: 'pic.png', mediaType: 'image/png', bytes: 4, width: 1, height: 1 }
   const imageMessage: HarnessMessage = { role: 'user', content: [{ type: 'image', attachment: ref }] }
 
-  const chat = buildRequestBody('chat', 'big-pickle', { messages: [imageMessage] }, localResolver)
+  const chat = await buildRequestBody('chat', 'big-pickle', { messages: [imageMessage] }, localResolver)
   const chatPart = ((chat.body.messages as Array<Record<string, unknown>>)[0]?.content as unknown[])[0] as Record<string, unknown>
   assert.match(String((chatPart.image_url as Record<string, string>).url), /^data:image\/png;base64,/)
 
-  const responses = buildRequestBody('responses', 'muse-spark-1.3-contributor-free', { messages: [imageMessage] }, localResolver)
+  const responses = await buildRequestBody('responses', 'muse-spark-1.3-contributor-free', { messages: [imageMessage] }, localResolver)
   const input = (responses.body.input as Array<Record<string, unknown>>)[0]
   const imageItem = (input?.content as Array<Record<string, unknown>> | undefined)?.find((c) => c.type === 'input_image')
   assert.ok(imageItem)
 
-  const anthropic = buildRequestBody('messages', 'union-alpha', { messages: [imageMessage] }, localResolver)
+  const anthropic = await buildRequestBody('messages', 'union-alpha', { messages: [imageMessage] }, localResolver)
   const block = ((anthropic.body.messages as Array<Record<string, unknown>>)[0]?.content as unknown[])[0] as Record<string, unknown>
   assert.equal((block.source as Record<string, unknown>).type, 'base64')
 })
 
-test('oversized and offloaded images ask the host to offload', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-big-'))
-  const file = join(dir, 'big.png')
-  writeFileSync(file, Buffer.alloc(MAX_IMAGE_BYTES + 1))
-  const bigResolver: ImageResolver = { hostPath: () => file }
-  assert.throws(
-    () => buildRequestBody('chat', 'big-pickle', { messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'big.png' } }] }] }, bigResolver),
-    (error: unknown) => error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED',
+test('oversized, unresolvable and offloaded images ask the host to offload one occurrence', async () => {
+  const bigResolver: ImageSource = {
+    load: async () => ({ mediaType: 'image/png', data: Buffer.alloc(MAX_IMAGE_BYTES + 1) }),
+  }
+  const isSingleOffload = (error: unknown): boolean =>
+    error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED' && error.offloadImages === 1
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'big.png' } }] }] }, bigResolver),
+    isSingleOffload,
   )
-  assert.throws(
-    () => buildRequestBody('chat', 'big-pickle', { messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'x' }, offloaded: true }] }] }, resolver),
-    (error: unknown) => error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED',
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'missing' } }] }] }, resolver),
+    isSingleOffload,
+  )
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'x' }, offloaded: true }] }] }, resolver),
+    isSingleOffload,
+  )
+})
+
+test('an unresolvable image names every occurrence up to its earliest position', async () => {
+  const source: ImageSource = {
+    load: async (ref) => (ref.attachmentId === 'missing' ? undefined : { mediaType: 'image/png', data: Buffer.alloc(1024) }),
+  }
+  const messages: HarnessMessage[] = [{
+    role: 'user',
+    content: [
+      { type: 'image', attachment: { attachmentId: 'ok-1' } },
+      { type: 'image', attachment: { attachmentId: 'missing' } },
+      { type: 'image', attachment: { attachmentId: 'ok-2' } },
+    ],
+  }]
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages }, source),
+    (error: unknown) => error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED' && error.offloadImages === 2,
+  )
+})
+
+test('the combined image budget reports the host-exact prefix count of oldest occurrences', async () => {
+  // Three images of 7 MiB raw each: every one passes the per-image ceiling,
+  // yet 21 MiB total exceeds the 16 MiB request ceiling once base64-encoded.
+  const perImage = 7 * 1024 * 1024
+  const source: ImageSource = {
+    load: async () => ({ mediaType: 'image/png', data: Buffer.alloc(perImage, 1) }),
+  }
+  const messages: HarnessMessage[] = [{
+    role: 'user',
+    content: [
+      { type: 'image', attachment: { attachmentId: 'a' } },
+      { type: 'image', attachment: { attachmentId: 'b' } },
+      { type: 'image', attachment: { attachmentId: 'c' } },
+    ],
+  }]
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages }, source),
+    (error: unknown) => error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED' && error.offloadImages === 1,
+  )
+})
+
+test('repeated occurrences of one attachment each count toward the offload budget', async () => {
+  const perImage = 7 * 1024 * 1024
+  const source: ImageSource = {
+    load: async () => ({ mediaType: 'image/png', data: Buffer.alloc(perImage, 1) }),
+  }
+  const messages: HarnessMessage[] = [{
+    role: 'user',
+    // Same attachment id three times: loaded once, counted three times.
+    content: [
+      { type: 'image', attachment: { attachmentId: 'repeat' } },
+      { type: 'image', attachment: { attachmentId: 'repeat' } },
+      { type: 'image', attachment: { attachmentId: 'repeat' } },
+    ],
+  }]
+  await assert.rejects(
+    buildRequestBody('chat', 'big-pickle', { messages }, source),
+    (error: unknown) => error instanceof GatewayFailure && error.code === 'IMAGE_OFFLOAD_REQUIRED' && error.offloadImages === 1,
   )
 })
 

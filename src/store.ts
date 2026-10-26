@@ -27,6 +27,8 @@ export function resolveDataDir(override?: string): string {
 export interface CachedCatalog {
   at: number
   ids: string[]
+  /** ETag of the last live listing, used for conditional re-fetches. */
+  etag?: string
 }
 
 export interface HealthSnapshot {

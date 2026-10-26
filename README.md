@@ -9,10 +9,10 @@ reasoning menu.
 
 - **Target host:** DSH Desktop `v0.12.1` (Windows x64), Harness
   `@deepseek-ai/dsh@0.2.1-rc.2`.
-- **Runtime shape:** one esbuild bundle (`dist/index.js`, ~80 KB), **zero
-  runtime dependencies** and no `@deepseek-ai/*` imports — the host validates
-  adapters structurally, so the bundle installs cleanly into the plugin
-  manager's hoisted pnpm generation.
+- **Runtime shape:** one esbuild bundle (`dist/index.js`, under 100 KB),
+  **zero runtime dependencies** and no `@deepseek-ai/*` imports — the host
+  validates adapters structurally, so the bundle installs cleanly into the
+  plugin manager's hoisted pnpm generation.
 - **License:** MIT.
 
 > German version: [`README.de.md`](./README.de.md).
@@ -47,19 +47,82 @@ The plugin reproduces the full current v2 client shape (gate state of
 
 ---
 
-## Install
+## Install on Windows x64 (DSH Desktop v0.12.1)
 
-### From a packed tarball (recommended for Windows)
+You need one file: the packed plugin **`opencode2dsh-0.1.0.tgz`**. Build it
+from source (Node.js ≥ 20.19) or take it from the release artifacts:
 
 ```powershell
+npm ci
 npm run build
 npm pack
-# produces opencode2dsh-0.1.0.tgz — copy it next to DSH Desktop, then:
+# -> opencode2dsh-0.1.0.tgz
+```
+
+The `web` profile is the one DSH Desktop loads. Two installation paths reach
+it; both leave the profile manifest to the host plugin manager.
+
+### Path A — the in-app Plugins page (no terminal)
+
+1. Open DSH Desktop and go to the sidebar **Plugins** page (also reachable as
+   *Workbench management → Installed* in builds that use that wording).
+2. Choose the local-package install action and select
+   `opencode2dsh-0.1.0.tgz`. The shipped build decides whether this entry is
+   offered for a local `.tgz`; if the page only knows registry packages, use
+   Path B.
+3. Let the installer finish, then **fully quit and reopen DSH Desktop**
+   (closing the window is not a quit).
+
+### Path B — the `dsh` CLI (works whenever the UI lacks a file picker)
+
+In PowerShell, from the folder holding the tarball:
+
+```powershell
 dsh plugin --profile web add .\opencode2dsh-0.1.0.tgz
 ```
 
-Restart DSH Desktop. The provider **OpenCode Free** appears in the model
-picker. Removal: `dsh plugin --profile web remove opencode2dsh`.
+`--profile web` belongs between `plugin` and the operation, exactly as the
+host's own plugin manager invokes it. If `dsh` is not on your `PATH`, run the
+command from the terminal DSH Desktop ships, or check the exact wording of
+your build with `dsh plugin add --help`; a tarball path or `file:` URL is an
+accepted install spec. Then fully quit and reopen DSH Desktop.
+
+### Verify it is live
+
+1. Restart completed without a Safe-Mode / plugin-failure prompt.
+2. The model picker shows the provider **OpenCode Free** with the current free
+   roster — it is refreshed from the gateway on every program start.
+3. Optional CLI proof that the profile loaded the layer:
+
+   ```powershell
+   dsh --profile web --dump-config | findstr /i opencode
+   ```
+
+No API key is ever asked for. If the picker is empty, see
+[Troubleshooting](#troubleshooting).
+
+### Uninstall
+
+```powershell
+dsh plugin --profile web remove opencode2dsh
+```
+
+Then restart DSH Desktop. The plugin's own cache directory
+(`<DSH_HOME>\opencode2dsh\`) is left behind and can be deleted by hand.
+
+### Windows paths used by the plugin
+
+DSH Desktop sets `DSH_HOME` for the Harness process; on a standard install it
+resolves to:
+
+```
+%APPDATA%\dsh-desktop\harness
+```
+
+- Web profile (manifest, `node_modules`, `cordis.patch.yml`):
+  `%APPDATA%\dsh-desktop\harness\profiles\web`
+- This plugin's own state (`catalog-cache.json`, `adapter-status.json`):
+  `%APPDATA%\dsh-desktop\harness\opencode2dsh`
 
 ### From the plugin market / a package name
 
@@ -74,7 +137,8 @@ The DSH plugin manager stages the package in a content-hashed generation under
 `$DSH_HOME/profiles/.generations/live/` with `node-linker=hoisted`, strips
 React/`@deepseek-ai/*` singletons, and inserts the Cordis row from
 `cordis.patch.yml`. This plugin has no install scripts and no runtime
-dependencies, so the generation contains only the bundle.
+dependencies (the bundle imports Node built-ins only), so the generation
+contains just the one bundle.
 
 ---
 
@@ -200,10 +264,16 @@ degrades the cache, never the provider:
 
 ### Error vocabulary surfaced to the harness
 
-`LANE_LOCKED` (free-tier gate), `REGION_BLOCKED`, `QUOTA_EXCEEDED` (with
-retry-after), `UNKNOWN_MODEL`, `CONTEXT_WINDOW_EXCEEDED`,
-`IMAGE_OFFLOAD_REQUIRED`, `UNSUPPORTED_CONTENT`, `INVALID_CREDENTIAL`,
-`EMPTY_RESPONSE`, `STREAM_CLOSED`, `STREAM_TIMEOUT`, `ABORTED`.
+The codes crossing the adapter boundary use the host's canonical taxonomy:
+`QUOTA` (with retry-after), `UNKNOWN_MODEL`, `CONTEXT_WINDOW_EXCEEDED`,
+`IMAGE_OFFLOAD_REQUIRED` (carrying the host-compatible `offloadImages`
+count), `UNSUPPORTED_CONTENT`, `INVALID_CONFIG`, `INVALID_CREDENTIAL`,
+`SERVER`, `EMPTY_RESPONSE`, `STREAM_CLOSED`, `TIMEOUT`, `ABORTED`, plus the
+free-lane-specific `LANE_LOCKED` (gate fingerprint failure) and
+`REGION_BLOCKED` / `HTML_INTERSTITIAL` edge classifications. The adapter
+declares `maxRetries: 0`, so the host's own retry waterfall never replays a
+free-lane turn; the plugin's single internal retry covers only pre-emission
+transport faults.
 
 ---
 
@@ -232,7 +302,7 @@ shipping modules (`src/fingerprint.ts`, `src/http.ts`, `src/stream.ts`).
 | Every model returns a free-tier / `LANE_LOCKED` error | The gateway fingerprint changed upstream, or the egress network rewrites TLS/UA. Check `adapter-status.json`, run `npm run smoke`, and update the plugin. |
 | Intermittent 403/429 even for official clients | Known gateway instability and per-session free quota. The plugin classifies these honestly and honors `Retry-After`; starting a new harness conversation mints a fresh upstream session. |
 | Region message | The free lane refuses some regions at the account edge; no client-side setting changes this. |
-| Image message asks to offload | Attachment exceeded 8 MB, was already offloaded, or has no host path. The host's image-offload flow handles it automatically. |
+| Image message asks to offload | An attachment exceeded the 8 MB per-image ceiling, the combined 16 MB request ceiling, was already offloaded, or has no host path. The failure names the exact `offloadImages` count; the host's image-offload flow drops that many oldest occurrences and retries automatically. |
 | Empty response / stream closed | The gateway ended without content (`EMPTY_RESPONSE`) or without a terminal event (`STREAM_CLOSED`). Retryable transport faults are retried once automatically. |
 | Picker shows the static roster after startup | The live listing could not be reached within `warmMs`; the startup backoff keeps retrying (up to every 30 s) and the picker refreshes itself automatically as soon as a live answer arrives. On later launches the disk cache is used until the first fresh fetch. |
 

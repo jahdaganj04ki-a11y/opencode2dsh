@@ -82,7 +82,7 @@ test('full chat turn: v2 fingerprint headers, injected tools, indexed chunks, us
 
   const adapter = makeAdapter()
   const chunks: StreamChunk[] = []
-  const stream = adapter.prepareCall(baseOptions).stream(baseOptions)
+  const stream = (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)
   for await (const chunk of stream) chunks.push(chunk)
 
   assert.equal(posts.length, 1)
@@ -117,7 +117,7 @@ test('FreeTierError 403 surfaces as a non-retryable LANE_LOCKED failure', async 
   const adapter = makeAdapter()
   await assert.rejects(
     async () => {
-      for await (const _ of adapter.prepareCall(baseOptions).stream(baseOptions)) {
+      for await (const _ of (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)) {
         // drain
       }
     },
@@ -146,7 +146,7 @@ test('length cut with answer text triggers exactly one tool-forbidden continuati
 
   const adapter = makeAdapter()
   const chunks: StreamChunk[] = []
-  for await (const chunk of adapter.prepareCall(baseOptions).stream(baseOptions)) chunks.push(chunk)
+  for await (const chunk of (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)) chunks.push(chunk)
 
   assert.equal(bodies.length, 2)
   const second = bodies[1]!
@@ -181,7 +181,7 @@ test('retryable 5xx on a clean first attempt is retried once and succeeds', asyn
   })
   const adapter = makeAdapter()
   const chunks: StreamChunk[] = []
-  for await (const chunk of adapter.prepareCall(baseOptions).stream(baseOptions)) chunks.push(chunk)
+  for await (const chunk of (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)) chunks.push(chunk)
   assert.equal(posts.filter((u) => u.endsWith('/chat/completions')).length, 2)
   const finish = chunks.at(-1) as Extract<StreamChunk, { type: 'finish' }>
   assert.deepEqual(finish.reason, { kind: 'stop' })
@@ -263,7 +263,7 @@ test('UNKNOWN_MODEL on a turn triggers an immediate catalog refresh without dela
   const modelsBefore = modelFetches
   await assert.rejects(
     async () => {
-      for await (const _ of adapter.prepareCall(baseOptions).stream(baseOptions)) void _
+      for await (const _ of (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)) void _
     },
     (error: unknown) => error instanceof LlmFailureError && error.code === 'UNKNOWN_MODEL',
   )
@@ -286,7 +286,7 @@ test('turn metrics are mirrored into the on-disk health snapshot', async () => {
     config: { diskCache: true, dataDir },
   })
   await assert.rejects(async () => {
-    for await (const _ of adapter.prepareCall(baseOptions).stream(baseOptions)) void _
+    for await (const _ of (await adapter.prepareCall('opencode-free', baseOptions.model)).stream(baseOptions)) void _
   })
   // Force a health write through a catalog refresh (the adapter records metrics in memory).
   const catalog = (adapter as unknown as { catalog: { refresh(): Promise<void> } }).catalog
@@ -303,17 +303,17 @@ test('turn metrics are mirrored into the on-disk health snapshot', async () => {
 
 test('resolveModel reports per-model context, output ceiling and reasoning menu', () => {
   const adapter = makeAdapter()
-  const deepseek = adapter.resolveModel('deepseek-v4.1-flash-free')
+  const deepseek = adapter.resolveModel('opencode-free', 'deepseek-v4.1-flash-free')
   assert.equal(deepseek.context!.contextWindow, 300_000)
   assert.equal(deepseek.defaultMaxTokens, 8192)
   assert.ok(deepseek.reasoning?.efforts.some((e) => e.id === 'disabled'))
   assert.equal(deepseek.reasoning?.defaultEffort, 'high')
 
-  const pickle = adapter.resolveModel('big-pickle')
+  const pickle = adapter.resolveModel('opencode-free', 'big-pickle')
   assert.equal(pickle.reasoning, undefined)
   assert.deepEqual(pickle.inputModalities, ['text', 'image'])
 
-  const beam = adapter.resolveModel('beam-free')
+  const beam = adapter.resolveModel('opencode-free', 'beam-free')
   assert.equal(beam.context!.contextWindow, 1_048_576)
   assert.deepEqual(beam.inputModalities, ['text'])
 })

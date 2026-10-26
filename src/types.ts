@@ -101,6 +101,8 @@ export interface LlmFailure {
   status?: number
   providerRetryAfterMs?: number
   requestId?: string
+  /** How many of the oldest retained image occurrences must be offloaded. */
+  offloadImages?: number
 }
 
 export type StreamChunk =
