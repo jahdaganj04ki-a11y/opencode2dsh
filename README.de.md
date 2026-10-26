@@ -157,10 +157,19 @@ den Provider:
 
 ## Wie eine Runde funktioniert
 
-1. **Katalog.** Ein Hintergrund-Refresh pollt `/inference/v1/models`; der
-   Picker wartet maximal `warmMs` und antwortet dann aus Live → Festplatten-Cache
-   → eingebautem Static-Roster. Freinamen-Regel, Blocklist und Allowlist
-   greifen an einer Stelle.
+1. **Katalog – immer aktuell, bei jedem Programmstart aktualisiert.** Sobald
+   das Plugin geladen ist, holt es `/inference/v1/models`; schlägt dieser
+   erste Abruf fehl, wiederholt er es nach kurzem Backoff (1 s, 2 s, 4 s,
+   8 s, 15 s, 30 s), bis die erste Live-Antwort da ist, und aktualisiert
+   danach alle `refreshSeconds`. Der Picker wartet maximal `warmMs` und
+   antwortet dann aus Live → Festplatten-Cache → eingebautem Static-Roster,
+   blockiert also nie. Sobald sich der zulässige Live-Roster tatsächlich
+   ändert, kündigt das Plugin den Adapter neu an (`handle.replace` →
+   Host-Event `llm/adapters-updated`); das macht den gecachten Roster im
+   Client ungültig, und jeder Modell-Picker liest `listModels()` automatisch
+   neu – ohne Neustart. Freinamen-Regel, Blocklist, Allowlist und
+   Deduplizierung greifen an einer Stelle (der Host lehnt Kataloge mit
+   doppelten IDs ab).
 2. **Request-Aufbau.** Harness-Nachrichten werden in die Wire des Modells
    konvertiert (Chat Completions / Responses / Messages). Tool-Call-/Tool-
    Result-Paare werden vorher repariert (Waisenresultate und unterbrochene
@@ -222,7 +231,7 @@ abgelehnt wird. Es nutzt exakt die ausgelieferten Module
 | Regionsmeldung | Die Free-Lane lehnt manche Regionen an der Kontokante ab; clientseitig nicht änderbar. |
 | Bildnachricht verlangt Auslagerung | Anhang über 8 MB, bereits ausgelagert oder ohne Host-Pfad. Der Host-Offload-Fluss greift automatisch. |
 | Empty response / stream closed | Das Gateway beendete ohne Inhalt (`EMPTY_RESPONSE`) oder ohne Terminal-Ereignis (`STREAM_CLOSED`). Retrybare Transportfehler werden automatisch einmal wiederholt. |
-| Picker zeigt nach dem Start das Static-Roster | Das Live-Listing war nicht innerhalb `warmMs` erreichbar; ein Refresh läuft im Hintergrund, beim nächsten Start greift der Festplatten-Cache. |
+| Picker zeigt nach dem Start das Static-Roster | Das Live-Listing war nicht innerhalb `warmMs` erreichbar; der Startup-Backoff wiederholt die Abrufe (maximal alle 30 s), und sobald eine Live-Antwort eintrifft, aktualisiert sich der Picker von selbst. Bei späteren Starts dient der Festplatten-Cache bis zum ersten Frisch-Abruf. |
 
 ### Ehrliche Grenzen
 

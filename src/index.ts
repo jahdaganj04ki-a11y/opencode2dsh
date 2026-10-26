@@ -13,7 +13,7 @@
 
 import { OpenCodeFreeAdapter } from './adapter.js'
 import { DEFAULT_PROVIDER_ID, resolveConfig, type PluginConfig } from './config.js'
-import type { PluginContext } from './types.js'
+import type { AdapterRegistrationHandle, PluginContext } from './types.js'
 
 export const name = 'opencode2dsh'
 export const inject = ['llm']
@@ -24,24 +24,43 @@ export function apply(ctx: PluginContext, rawConfig?: PluginConfig): void {
   const config = resolveConfig(rawConfig)
   const providerId = config.providerId || DEFAULT_PROVIDER_ID
 
-  const adapter = new OpenCodeFreeAdapter({ logger: ctx.logger, ctx, config: rawConfig })
+  // Assigned right after construction. The catalog's first fetch is async, so
+  // it can never resolve before this synchronous registration completes.
+  let handle: AdapterRegistrationHandle | undefined
 
-  const handle = ctx.llm.registerAdapter([providerId], adapter)
-
-  // Re-announce the route so model pickers pick it up on hot reload as well.
-  if (handle && typeof handle.replace === 'function') {
+  // Re-commit the route whenever the live roster changes: the host swap emits
+  // `llm/adapters-updated`, whose consumers discard their cached roster and
+  // re-read `listModels()`. This is what keeps the picker current after the
+  // startup refresh and every later background refresh.
+  const announce = (): void => {
     try {
-      handle.replace([providerId])
+      if (handle && typeof handle.replace === 'function') {
+        handle.replace([providerId])
+      } else if (typeof ctx.emit === 'function') {
+        ctx.emit('llm/adapters-updated')
+      }
     } catch (error) {
-      ctx.logger.warn?.('[opencode2dsh] adapter replace() announcement failed', error)
+      ctx.logger.warn?.('[opencode2dsh] roster announcement failed', error)
     }
   }
+
+  const adapter = new OpenCodeFreeAdapter({
+    logger: ctx.logger,
+    ctx,
+    config: rawConfig,
+    onRosterChange: announce,
+  })
+
+  handle = ctx.llm.registerAdapter([providerId], adapter)
+  // Initial announcement: also covers hot reloads and immediately invalidates
+  // any roster a previous generation left cached.
+  announce()
 
   ctx.logger.info?.(`[opencode2dsh] provider "${providerId}" registered (${PROVIDER_LABEL})`)
 
   ctx.effect?.(() => () => {
     try {
-      handle()
+      handle?.()
     } catch {
       // Already unregistered by host teardown.
     }

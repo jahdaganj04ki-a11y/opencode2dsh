@@ -150,10 +150,18 @@ degrades the cache, never the provider:
 
 ## How a turn works
 
-1. **Catalog.** A background refresh polls `/inference/v1/models`; the picker
-   waits at most `warmMs`, then answers from live → disk cache → the baked-in
-   static roster. Free-name rule, blocklist and allowlist are applied in one
-   place.
+1. **Catalog — always current, refreshed at every program start.** As soon as
+   the plugin loads it fetches `/inference/v1/models`; if that first fetch
+   fails it retries on a short backoff (1 s, 2 s, 4 s, 8 s, 15 s, 30 s) until
+   the first live answer arrives, then keeps refreshing every
+   `refreshSeconds`. The picker waits at most `warmMs`, then answers from live
+   → disk cache → the baked-in static roster, so it never blocks. Whenever the
+   eligible live roster actually changes, the plugin re-announces the adapter
+   (`handle.replace` → host event `llm/adapters-updated`), which invalidates
+   the client's cached roster and makes every model picker re-read
+   `listModels()` automatically — no restart needed. Free-name rule,
+   blocklist, allowlist and de-duplication are applied in one place (the host
+   rejects catalogs containing duplicate ids).
 2. **Request build.** Harness messages are converted to the model's wire
    (Chat Completions / Responses / Messages). Tool-call/tool-result pairing is
    repaired first (orphan results and interrupted calls are filled so strict
@@ -212,7 +220,7 @@ shipping modules (`src/fingerprint.ts`, `src/http.ts`, `src/stream.ts`).
 | Region message | The free lane refuses some regions at the account edge; no client-side setting changes this. |
 | Image message asks to offload | Attachment exceeded 8 MB, was already offloaded, or has no host path. The host's image-offload flow handles it automatically. |
 | Empty response / stream closed | The gateway ended without content (`EMPTY_RESPONSE`) or without a terminal event (`STREAM_CLOSED`). Retryable transport faults are retried once automatically. |
-| Picker shows the static roster after startup | The live listing could not be reached within `warmMs`; a refresh continues in the background and the disk cache is used on the next launch. |
+| Picker shows the static roster after startup | The live listing could not be reached within `warmMs`; the startup backoff keeps retrying (up to every 30 s) and the picker refreshes itself automatically as soon as a live answer arrives. On later launches the disk cache is used until the first fresh fetch. |
 
 ### Known scope and honest limitations
 

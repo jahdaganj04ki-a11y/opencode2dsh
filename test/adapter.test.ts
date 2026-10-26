@@ -183,6 +183,40 @@ test('retryable 5xx on a clean first attempt is retried once and succeeds', asyn
   assert.deepEqual(finish.reason, { kind: 'stop' })
 })
 
+test('a changed live roster re-announces the adapter so the picker re-reads listModels', async () => {
+  const replaceCalls: string[][] = []
+  const emits: string[] = []
+  const ctx: PluginContext = {
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    llm: {
+      registerAdapter: (providers: string[]) => {
+        const handle = (() => undefined) as unknown as { (): void; replace(p: string[]): void }
+        handle.replace = (p: string[]) => replaceCalls.push(p)
+        return handle
+      },
+    } as unknown as PluginContext['llm'],
+    get: () => undefined,
+    effect: () => undefined,
+    emit: (event: string) => emits.push(event),
+  }
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    if (String(url).endsWith('/models')) {
+      return jsonResponse({ data: [{ id: 'big-pickle' }, { id: 'beam-free' }, { id: 'glm-5.3-flash-free' }] })
+    }
+    throw new Error('unexpected call')
+  })
+
+  const { apply } = await import('../src/index.js')
+  apply(ctx, { diskCache: false, warmMs: 2000 })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+
+  // One announcement at registration plus one when the live roster differs
+  // from the static bootstrap list.
+  assert.ok(replaceCalls.length >= 2, `expected registration + roster announcements, got ${replaceCalls.length}`)
+  assert.ok(replaceCalls.every((p) => p.length === 1 && p[0] === 'opencode-free'))
+  assert.equal(emits.length, 0)
+})
+
 test('resolveModel reports per-model context, output ceiling and reasoning menu', () => {
   const adapter = makeAdapter()
   const deepseek = adapter.resolveModel('deepseek-v4.1-flash-free')

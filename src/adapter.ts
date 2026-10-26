@@ -148,6 +148,11 @@ export interface AdapterDeps {
   logger: Logger
   ctx: PluginContext
   config?: PluginConfig
+  /**
+   * Fired whenever the eligible live roster changes. The plugin uses it to
+   * re-announce the adapter so cached model pickers re-read `listModels()`.
+   */
+  onRosterChange?: () => void
 }
 
 export class OpenCodeFreeAdapter {
@@ -158,7 +163,7 @@ export class OpenCodeFreeAdapter {
   constructor(deps: AdapterDeps) {
     this.config = resolveConfig(deps.config)
     const store = new JsonStore(resolveDataDir(this.config.dataDir))
-    this.catalog = new ModelCatalog(this.config, store, deps.logger)
+    this.catalog = new ModelCatalog(this.config, store, deps.logger, deps.onRosterChange)
     this.catalog.start()
     this.resolver = new AttachmentResolver(deps.ctx)
     deps.ctx.effect?.(() => () => this.catalog.dispose())
