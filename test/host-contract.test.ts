@@ -190,3 +190,25 @@ test('closing the iterator early aborts the in-flight gateway request', async ()
   assert.ok(observedSignal)
   assert.equal(observedSignal?.aborted, true)
 })
+
+test('resolveModel echoes the exact model id even when a display suffix is present', async () => {
+  mock.method(globalThis, 'fetch', async (url: unknown) =>
+    String(url).endsWith('/models') ? jsonResponse(modelsEnvelope) : jsonResponse({ error: 'no' }, 500),
+  )
+  const adapter = new OpenCodeFreeAdapter({ logger: silentLogger, ctx: makeContext(), config: { diskCache: false } })
+
+  const plain = adapter.resolveModel('opencode-free', 'big-pickle')
+  assert.equal(plain.id, 'big-pickle')
+  assert.equal(plain.provider, 'opencode-free')
+
+  // Host normalizeModelInfo rejects anything where resolved.id !== model.
+  const suffixed = adapter.resolveModel('opencode-free', 'big-pickle (Fast)')
+  assert.equal(suffixed.id, 'big-pickle (Fast)')
+  assert.equal(typeof suffixed.name, 'string')
+  assert.ok(suffixed.name.length > 0)
+  assert.ok(suffixed.context!.contextWindow > 0)
+
+  // prepareCall must expose the same verbatim identity on its model binding.
+  const prepared = await adapter.prepareCall('opencode-free', 'big-pickle (Fast)', undefined)
+  assert.equal(prepared.model.id, 'big-pickle (Fast)')
+})

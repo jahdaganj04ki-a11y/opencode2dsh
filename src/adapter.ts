@@ -332,10 +332,13 @@ export class OpenCodeFreeAdapter {
   }
 
   resolveModel(_provider: string, model: string, _signal?: AbortSignal): ResolvedModelInfo {
+    // The host requires `resolved.id === model` verbatim (INVALID_MODEL_INFO
+    // otherwise); baseModelId only selects the capability record, so a
+    // display suffix a picker may append never breaks the identity round-trip.
     const cap = capabilitiesFor(baseModelId(model))
     const info: ResolvedModelInfo = {
       provider: this.config.providerId,
-      id: baseModelId(model),
+      id: model,
       name: cap.name,
       inputModalities: cap.vision ? (['text', 'image'] as const) : (['text'] as const),
       context: { contextWindow: cap.contextWindow },
