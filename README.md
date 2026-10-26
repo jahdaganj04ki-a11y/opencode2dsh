@@ -16,6 +16,11 @@ reasoning menu.
 - **License:** MIT.
 
 > German version: [`README.de.md`](./README.de.md).
+>
+> Wire-level research (headers, session algorithm, endpoint topology, with
+> evidence from the official client binary and source):
+> [`docs/free-lane-research-2026-10.md`](./docs/free-lane-research-2026-10.md)
+> · [Deutsch](./docs/free-lane-research-2026-10.de.md).
 
 ---
 

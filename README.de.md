@@ -17,6 +17,11 @@ Reasoning-Menü).
 - **Lizenz:** MIT.
 
 > Englische Fassung: [`README.md`](./README.md).
+>
+> Wire-Recherche (Header, Session-Algorithmus, Endpunkt-Topologie, belegt
+> anhand der offiziellen Client-Binärdatei und des Quelltexts):
+> [`docs/free-lane-research-2026-10.de.md`](./docs/free-lane-research-2026-10.de.md)
+> · [English](./docs/free-lane-research-2026-10.md).
 
 ---
 
