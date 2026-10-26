@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { capabilitiesFor, baseModelId } from './capabilities.js'
 import { resolveConfig, type PluginConfig, type ResolvedConfig } from './config.js'
 import { JsonStore, resolveDataDir, resolveDshHome } from './store.js'
+import { TurnMetrics } from './metrics.js'
 import { ModelCatalog } from './catalog.js'
 import { applyFingerprint, gatewayHeaders, sessionForConversation } from './fingerprint.js'
 import { CODE, GatewayFailure, StreamTimeout, openGatewayStream } from './http.js'
@@ -28,6 +29,7 @@ import {
   estimateMessageTokens,
   estimateTokens,
   hasImageBlocks,
+  MAX_IMAGE_BYTES,
   type ImageResolver,
 } from './messages.js'
 import { applyEffort, defaultEffortId, effortMenu } from './effort.js'
@@ -39,10 +41,12 @@ import type {
   GenerateOptions,
   HarnessMessage,
   ImageAttachmentRef,
+  ImageRequestTargetInfo,
   LlmFailure,
   Logger,
   ModelInfo,
   PluginContext,
+  ProviderRetryPolicy,
   ReasoningBlock,
   ResolvedModelInfo,
   StreamChunk,
@@ -53,6 +57,20 @@ import type {
 
 const PROVIDER_NAME = 'OpenCode Free'
 const MIN_CONTINUATION_BUDGET = 1024
+
+/**
+ * Host-level retries are disabled on purpose: the turn engine below already
+ * owns exactly one clean-stream retry plus one continuation, and knows which
+ * failures are final (LANE_LOCKED, REGION_BLOCKED, QUOTA_EXCEEDED). Letting the
+ * optional dsh-llm-retry extension add its default five attempts would only
+ * multiply free-lane traffic against non-retryable answers.
+ */
+const PROVIDER_RETRY_POLICY: ProviderRetryPolicy = Object.freeze({
+  mode: 'normal',
+  maxRetries: 0,
+  retryableCodes: Object.freeze([]),
+  backoff: Object.freeze({ initialDelayMs: 500, maxDelayMs: 10_000, jitterRatio: 0.1 }),
+})
 const CONTINUATION_PROMPT =
   'Continue your previous answer exactly where it stopped. Do not repeat anything you already wrote, and do not call any tools.'
 const ATTACHMENT_SERVICE_TOKENS = ['attachment', 'dsh-attachment-local', 'dsh-attachment', 'attachment-local']
@@ -159,11 +177,16 @@ export class OpenCodeFreeAdapter {
   private readonly config: ResolvedConfig
   private readonly catalog: ModelCatalog
   private readonly resolver: ImageResolver
+  private readonly metrics = new TurnMetrics()
+  private readonly logger: Logger
 
   constructor(deps: AdapterDeps) {
+    this.logger = deps.logger
     this.config = resolveConfig(deps.config)
     const store = new JsonStore(resolveDataDir(this.config.dataDir))
-    this.catalog = new ModelCatalog(this.config, store, deps.logger, deps.onRosterChange)
+    this.catalog = new ModelCatalog(this.config, store, deps.logger, deps.onRosterChange, Date.now, {
+      metrics: () => this.metrics.snapshot(),
+    })
     this.catalog.start()
     this.resolver = new AttachmentResolver(deps.ctx)
     deps.ctx.effect?.(() => () => this.catalog.dispose())
@@ -171,6 +194,28 @@ export class OpenCodeFreeAdapter {
 
   providerInfo(): { id: string; name: string } {
     return { id: this.config.providerId, name: PROVIDER_NAME }
+  }
+
+  /** The host captures this at registration; zero retries keeps retry authority in the turn engine. */
+  providerRetryPolicy(): ProviderRetryPolicy {
+    return PROVIDER_RETRY_POLICY
+  }
+
+  /** Free lane carries no per-image pricing; the host falls back to its neutral estimate. */
+  imageRequestPricing(): undefined {
+    return undefined
+  }
+
+  /**
+   * We never resize: intrinsic dimensions pass through. The byte target is the
+   * same 8 MB ceiling `messages.ts` enforces when embedding the attachment, so
+   * host-side admission/downscaling decisions match our own serializer.
+   */
+  imageRequestTarget(_provider: string, _model: string, image: ImageAttachmentRef): ImageRequestTargetInfo {
+    const width = typeof image?.width === 'number' && Number.isFinite(image.width) ? image.width : 0
+    const height = typeof image?.height === 'number' && Number.isFinite(image.height) ? image.height : 0
+    const bytes = typeof image?.bytes === 'number' && Number.isFinite(image.bytes) ? image.bytes : MAX_IMAGE_BYTES
+    return { width, height, maxBytes: Math.min(bytes, MAX_IMAGE_BYTES) }
   }
 
   async listModels(): Promise<ModelInfo[]> {
@@ -225,6 +270,21 @@ export class OpenCodeFreeAdapter {
         wake?.()
       },
       (error: unknown) => {
+        const mapped = toLlmFailure(error)
+        this.metrics.recordFailure(mapped.code, { requestId: mapped.requestId, status: mapped.status })
+        this.logger.warn?.(
+          `[opencode2dsh] turn failed: ${mapped.code}` +
+            `${mapped.status ? ` status=${mapped.status}` : ''}` +
+            `${mapped.requestId ? ` request=${mapped.requestId}` : ''}` +
+            `${mapped.providerRetryAfterMs ? ` retryAfter=${mapped.providerRetryAfterMs}ms` : ''}`,
+        )
+        // A delisted id: refresh the catalog immediately so the picker drops
+        // it on the next announcement instead of waiting for the interval.
+        if (mapped.code === CODE.UNKNOWN_MODEL) {
+          this.catalog.refresh().catch((refreshError: unknown) => {
+            this.logger.warn?.('[opencode2dsh] post-failure catalog refresh failed', refreshError)
+          })
+        }
         failure = error
         settled = true
         wake?.()
@@ -249,6 +309,7 @@ export class OpenCodeFreeAdapter {
   }
 
   private async runTurn(options: GenerateOptions, emit: (chunk: StreamChunk) => void): Promise<void> {
+    this.metrics.recordTurn()
     const base = baseModelId(options.model)
     const cap = capabilitiesFor(base)
 
@@ -292,6 +353,7 @@ export class OpenCodeFreeAdapter {
           sink.empty &&
           ((error instanceof GatewayFailure && error.retryable) || error instanceof StreamTimeout)
         if (!retryable) throw error
+        this.metrics.recordRetry()
         await sleepAbortable(400 * attempt + Math.floor(Math.random() * 200), options.signal)
         continue
       }
@@ -299,6 +361,7 @@ export class OpenCodeFreeAdapter {
       if (result.usage) usage = mergeUsage(usage, result.usage)
 
       if (attempt < maxAttempts && this.shouldContinue(result, current, sink, cap.contextWindow)) {
+        this.metrics.recordContinuation()
         current = this.continuationOptions(current, sink)
         continue
       }

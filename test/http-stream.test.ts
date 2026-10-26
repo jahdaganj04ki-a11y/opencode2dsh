@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test, afterEach, mock } from 'node:test'
-import { CODE, GatewayFailure, StreamTimeout, openGatewayStream } from '../src/http.js'
+import { CODE, GatewayFailure, StreamTimeout, fetchJson, openGatewayStream } from '../src/http.js'
 
 const encoder = new TextEncoder()
 
@@ -67,6 +67,34 @@ test('FreeTierError non-2xx answer becomes a final LANE_LOCKED failure', async (
   await assert.rejects(
     openGatewayStream('https://example.invalid/x', {}, {}, undefined, { firstEventMs: 1000, bodyIdleMs: 1000 }),
     (error: unknown) => error instanceof GatewayFailure && error.code === CODE.LANE_LOCKED && error.retryable === false,
+  )
+})
+
+function hangingFetch(): (url: unknown, init?: RequestInit) => Promise<Response> {
+  // Mirror undici: aborting the signal rejects the in-flight fetch.
+  return (_url: unknown, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener(
+        'abort',
+        () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+        { once: true },
+      )
+    })
+}
+
+test('fetchJson enforces its own timeout on a hanging listing fetch', async () => {
+  mock.method(globalThis, 'fetch', hangingFetch())
+  await assert.rejects(
+    fetchJson('https://example.invalid/models', { timeoutMs: 30 }),
+    (error: unknown) => error instanceof GatewayFailure && error.code === CODE.UPSTREAM && error.retryable === true,
+  )
+})
+
+test('the pre-response watchdog turns a hanging connect into StreamTimeout', async () => {
+  mock.method(globalThis, 'fetch', hangingFetch())
+  await assert.rejects(
+    openGatewayStream('https://example.invalid/x', {}, {}, undefined, { firstEventMs: 30, bodyIdleMs: 5000 }),
+    (error: unknown) => error instanceof StreamTimeout && error.phase === 'first-event',
   )
 })
 

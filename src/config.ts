@@ -24,6 +24,8 @@ export interface PluginConfig {
   bodyIdleMs?: number
   /** Watchdog: ms of mid-stream silence on the Responses wire (bursty think). */
   responsesBodyIdleMs?: number
+  /** Watchdog: ms for the catalog listing fetch (connect + headers + body). */
+  listTimeoutMs?: number
   /** Disable the disk catalog cache (tests). */
   diskCache?: boolean
   /** Override the data directory (tests). */
@@ -37,10 +39,12 @@ export const DEFAULT_WARM_MS = 4000
 export const DEFAULT_FIRST_EVENT_MS = 30_000
 export const DEFAULT_BODY_IDLE_MS = 120_000
 export const DEFAULT_RESPONSES_BODY_IDLE_MS = 300_000
+export const DEFAULT_LIST_TIMEOUT_MS = 15_000
 
 const MIN = 1
 const MAX_REFRESH = 24 * 3600
 const MAX_TIMEOUT = 600_000
+const MAX_LIST_TIMEOUT = 120_000
 
 function integer(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
@@ -63,6 +67,7 @@ export interface ResolvedConfig {
   firstEventMs: number
   bodyIdleMs: number
   responsesBodyIdleMs: number
+  listTimeoutMs: number
   diskCache: boolean
   dataDir?: string
 }
@@ -82,6 +87,7 @@ export function resolveConfig(raw: PluginConfig | undefined): ResolvedConfig {
     firstEventMs: integer(config.firstEventMs, DEFAULT_FIRST_EVENT_MS, MIN, MAX_TIMEOUT),
     bodyIdleMs: integer(config.bodyIdleMs, DEFAULT_BODY_IDLE_MS, MIN, MAX_TIMEOUT),
     responsesBodyIdleMs: integer(config.responsesBodyIdleMs, DEFAULT_RESPONSES_BODY_IDLE_MS, MIN, MAX_TIMEOUT),
+    listTimeoutMs: integer(config.listTimeoutMs, DEFAULT_LIST_TIMEOUT_MS, 1_000, MAX_LIST_TIMEOUT),
     diskCache: config.diskCache !== false,
     dataDir: typeof config.dataDir === 'string' && config.dataDir.trim() !== '' ? config.dataDir : undefined,
   }

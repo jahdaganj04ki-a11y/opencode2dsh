@@ -136,9 +136,10 @@ laufen über den `config`-Block in `cordis.patch.yml`, z. B.
 | `refreshSeconds` | `300` | Katalog-Aktualisierung (30 s – 24 h). |
 | `warmMs` | `4000` | Begrenzte Wartezeit auf das erste Live-Listing in `listModels`. |
 | `allowedModels` | `[]` | Allowlist exakter IDs; leer zeigt alle zulässigen Freimodelle. |
-| `firstEventMs` | `30000` | Watchdog: ms bis zum ersten Stream-Ereignis. |
+| `firstEventMs` | `30000` | Watchdog: ms bis zum ersten Stream-Ereignis (deckt auch Connect + Header ab). |
 | `bodyIdleMs` | `120000` | Watchdog: Stille im Stream bei chat/messages. |
 | `responsesBodyIdleMs` | `300000` | Stille auf der burstigen Responses-Wire. |
+| `listTimeoutMs` | `15000` | Frist für einen Katalog-Listing-Abruf (Connect + Body). |
 | `diskCache` | `true` | Katalog-Cache und Health-Snapshot persistieren. |
 | `dataDir` | – | Datenverzeichnis überschreiben (Tests/portable Setups). |
 
@@ -151,7 +152,10 @@ den Provider:
 
 - `catalog-cache.json` – das letzte Live-Listing (7 Tage TTL).
 - `adapter-status.json` – Health-Snapshot (`ready` / `stale` /
-  `bootstrapping` / `error`, Anzahl sichtbarer Modelle, letzter Fehler).
+  `bootstrapping` / `error`, Anzahl sichtbarer Modelle, letzter Fehler) samt
+  Turn-Metriken: Gesamtzahl der Runden, interne Retries und Fortsetzungen,
+  Fehlerzählung pro Code sowie der letzte Fehler mit Gateway-`requestId`
+  bzw. Status für Supportfälle.
 
 ---
 
@@ -161,7 +165,8 @@ den Provider:
    das Plugin geladen ist, holt es `/inference/v1/models`; schlägt dieser
    erste Abruf fehl, wiederholt er es nach kurzem Backoff (1 s, 2 s, 4 s,
    8 s, 15 s, 30 s), bis die erste Live-Antwort da ist, und aktualisiert
-   danach alle `refreshSeconds`. Der Picker wartet maximal `warmMs` und
+   danach alle `refreshSeconds` (±15 % Jitter, damit Desktop-Instanzen nicht
+   synchron pollen). Der Picker wartet maximal `warmMs` und
    antwortet dann aus Live → Festplatten-Cache → eingebautem Static-Roster,
    blockiert also nie. Sobald sich der zulässige Live-Roster tatsächlich
    ändert, kündigt das Plugin den Adapter neu an (`handle.replace` →
@@ -169,7 +174,9 @@ den Provider:
    Client ungültig, und jeder Modell-Picker liest `listModels()` automatisch
    neu – ohne Neustart. Freinamen-Regel, Blocklist, Allowlist und
    Deduplizierung greifen an einer Stelle (der Host lehnt Kataloge mit
-   doppelten IDs ab).
+   doppelten IDs ab). Ein Listing, das plötzlich kein zulässiges Freimodell
+   mehr enthält, wird wie Abruffehler behandelt: Der vorherige Roster bleibt
+   erhalten und wird erneut abgerufen, statt den Picker zu leeren.
 2. **Request-Aufbau.** Harness-Nachrichten werden in die Wire des Modells
    konvertiert (Chat Completions / Responses / Messages). Tool-Call-/Tool-
    Result-Paare werden vorher repariert (Waisenresultate und unterbrochene
@@ -183,16 +190,25 @@ den Provider:
    gepatcht (`reasoning_effort`, GLMs `thinking`/`output_config`, verschachteltes
    `reasoning` bei Responses, Token-Budgets bei Anthropic). Die „Aus"-Stufe
    wird nur gesendet, wo das Modell Denken wirklich abschalten kann.
-4. **Transport.** Ein POST, SSE gestreamt mit zwei Watchdogs. Nicht-2xx-
-   Antworten werden klassifiziert: `FreeTierError`/`RegionError` sind final,
-   429 trägt `Retry-After`, 5xx/Verbindungsfehler sind retrybar. HTML-
-   Interstitials und Nicht-Stream-JSON-Hüllen werden explizit behandelt.
-5. **Runden-Engine (max. zwei Versuche).** Ein retrybarer Transportfehler
-   wiederholt Versuch eins nur, solange noch nichts emittiert wurde. Ein
-   stiller Reasoning-only-Stopp oder ein Längen-Schnitt mit bereits
-   vorhandenem Antworttext löst genau eine tool-freie Fortsetzung aus, wenn
-   das Kontextbudget reicht; Usage wird über die Versuche summiert, und das
-   terminierende Finish folgt auf den Usage-Chunk.
+4. **Transport.** Ein POST, SSE gestreamt mit zwei Watchdogs, die auch die
+   Connect-/Header-Phase begrenzen, plus eine eigene Frist für
+   Katalog-Abrufe. Nicht-2xx-Antworten werden klassifiziert:
+   `FreeTierError`/`RegionError` sind final, 429 trägt `Retry-After`,
+   5xx/Verbindungsfehler sind retrybar. HTML-Interstitials und
+   Nicht-Stream-JSON-Hüllen werden explizit behandelt.
+5. **Runden-Engine (max. zwei Versuche).** Der Adapter deklariert eine
+   Host-Retry-Policy mit `maxRetries: 0` und ist damit die einzige
+   Retry-Instanz: Ein retrybarer Transportfehler wiederholt Versuch eins nur,
+   solange noch nichts emittiert wurde. Ein stiller Reasoning-only-Stopp oder
+   ein Längen-Schnitt mit bereits vorhandenem Antworttext löst genau eine
+   tool-freie Fortsetzung aus, wenn das Kontextbudget reicht; Usage wird über
+   die Versuche summiert, und das terminierende Finish folgt auf den
+   Usage-Chunk. Eine `UNKNOWN_MODEL`-Antwort stößt zusätzlich sofort einen
+   Katalog-Refresh an, sodass ein delistetes ID ohne Wartezeit auf das
+   Intervall aus dem Picker verschwindet.
+6. **Bild-Zulassung.** `imageRequestTarget` reicht die intrinsischen Maße
+   durch und deklariert dieselbe 8-MB-Obergrenze, die der Serializer
+   erzwingt – Host-seitige Zulassung und Request-Aufbau bleiben konsistent.
 
 ### An den Harness gemeldete Fehler
 

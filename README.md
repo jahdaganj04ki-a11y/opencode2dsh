@@ -130,9 +130,10 @@ cannot crash the composition. Override through the row's `config` block in
 | `refreshSeconds` | `300` | Catalog refresh cadence (30 s – 24 h). |
 | `warmMs` | `4000` | Bounded wait for the first live listing inside `listModels`. |
 | `allowedModels` | `[]` | Exact-id allowlist; empty exposes every eligible free model. |
-| `firstEventMs` | `30000` | Watchdog: ms to the first stream event. |
+| `firstEventMs` | `30000` | Watchdog: ms to the first stream event (also bounds connect + response headers). |
 | `bodyIdleMs` | `120000` | Watchdog: mid-stream silence on chat/messages. |
 | `responsesBodyIdleMs` | `300000` | Mid-stream silence on the bursty Responses wire. |
+| `listTimeoutMs` | `15000` | Deadline for a catalog listing fetch (connect + body). |
 | `diskCache` | `true` | Persist catalog cache and health snapshot. |
 | `dataDir` | — | Override the data directory (tests/portable setups). |
 
@@ -144,7 +145,9 @@ degrades the cache, never the provider:
 
 - `catalog-cache.json` — the last live listing (7-day TTL).
 - `adapter-status.json` — health snapshot (`ready` / `stale` /
-  `bootstrapping` / `error`, exposed count, last error).
+  `bootstrapping` / `error`, exposed count, last error) plus turn metrics:
+  total turns, internal retries and continuations, failure counts per code,
+  and the last failure with its gateway `requestId`/status for support cases.
 
 ---
 
@@ -154,14 +157,17 @@ degrades the cache, never the provider:
    the plugin loads it fetches `/inference/v1/models`; if that first fetch
    fails it retries on a short backoff (1 s, 2 s, 4 s, 8 s, 15 s, 30 s) until
    the first live answer arrives, then keeps refreshing every
-   `refreshSeconds`. The picker waits at most `warmMs`, then answers from live
+   `refreshSeconds` (±15 % jitter so desktop installs do not poll in
+   lockstep). The picker waits at most `warmMs`, then answers from live
    → disk cache → the baked-in static roster, so it never blocks. Whenever the
    eligible live roster actually changes, the plugin re-announces the adapter
    (`handle.replace` → host event `llm/adapters-updated`), which invalidates
    the client's cached roster and makes every model picker re-read
    `listModels()` automatically — no restart needed. Free-name rule,
    blocklist, allowlist and de-duplication are applied in one place (the host
-   rejects catalogs containing duplicate ids).
+   rejects catalogs containing duplicate ids). A listing that suddenly exposes
+   zero eligible models is treated as a fetch failure: the previous roster is
+   kept and retried instead of emptying the picker.
 2. **Request build.** Harness messages are converted to the model's wire
    (Chat Completions / Responses / Messages). Tool-call/tool-result pairing is
    repaired first (orphan results and interrupted calls are filled so strict
@@ -174,15 +180,23 @@ degrades the cache, never the provider:
    (`reasoning_effort`, GLM's `thinking`/`output_config`, Responses' nested
    `reasoning`, Anthropic token budgets). The off rung is only sent where the
    model really supports disabling thinking.
-4. **Transport.** One POST, SSE streamed with two watchdogs. Non-2xx answers
-   are classified: `FreeTierError`/`RegionError` are final, 429 carries
-   `Retry-After`, 5xx/connection faults are retryable. HTML interstitials and
-   non-stream JSON envelopes are handled explicitly.
-5. **Turn engine (max two attempts).** A retryable transport failure repeats
-   attempt one only while nothing has been emitted. A silent reasoning-only
-   stop, or a length cut that already produced answer text, gets exactly one
-   tool-forbidden continuation when the context budget allows; usage is
-   summed across attempts and the terminal finish follows the usage chunk.
+4. **Transport.** One POST, SSE streamed with two watchdogs that also bound
+   the connect/headers phase, and a separate timeout for catalog fetches.
+   Non-2xx answers are classified: `FreeTierError`/`RegionError` are final,
+   429 carries `Retry-After`, 5xx/connection faults are retryable. HTML
+   interstitials and non-stream JSON envelopes are handled explicitly.
+5. **Turn engine (max two attempts).** The adapter declares a host retry
+   policy of `maxRetries: 0`, so it is the single retry authority: a
+   retryable transport failure repeats attempt one only while nothing has
+   been emitted. A silent reasoning-only stop, or a length cut that already
+   produced answer text, gets exactly one tool-forbidden continuation when
+   the context budget allows; usage is summed across attempts and the
+   terminal finish follows the usage chunk. An `UNKNOWN_MODEL` answer
+   additionally triggers an immediate catalog refresh, so a delisted id
+   disappears from the picker without waiting for the next interval.
+6. **Image admission.** `imageRequestTarget` passes intrinsic dimensions
+   through and declares the same 8 MB ceiling the serializer enforces,
+   keeping host-side admission and request building consistent.
 
 ### Error vocabulary surfaced to the harness
 

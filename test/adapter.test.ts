@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import { test, afterEach, mock } from 'node:test'
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { OpenCodeFreeAdapter, LlmFailureError } from '../src/adapter.js'
 import { CLIENT_UA } from '../src/fingerprint.js'
+import { MAX_IMAGE_BYTES } from '../src/messages.js'
 import type { GenerateOptions, PluginContext, StreamChunk } from '../src/types.js'
 
 const encoder = new TextEncoder()
@@ -215,6 +219,86 @@ test('a changed live roster re-announces the adapter so the picker re-reads list
   assert.ok(replaceCalls.length >= 2, `expected registration + roster announcements, got ${replaceCalls.length}`)
   assert.ok(replaceCalls.every((p) => p.length === 1 && p[0] === 'opencode-free'))
   assert.equal(emits.length, 0)
+})
+
+test('providerRetryPolicy disables host-level retries so the turn engine stays the sole authority', () => {
+  const adapter = makeAdapter()
+  const policy = adapter.providerRetryPolicy()
+  assert.equal(policy.mode, 'normal')
+  assert.equal(policy.maxRetries, 0)
+  assert.deepEqual(policy.retryableCodes, [])
+  assert.ok(policy.backoff.initialDelayMs > 0)
+})
+
+test('imageRequestTarget passes dimensions through and caps bytes at the 8MB embedding ceiling', () => {
+  const adapter = makeAdapter()
+  const small = adapter.imageRequestTarget('opencode-free', 'big-pickle', {
+    attachmentId: 'a1', mediaType: 'image/png', bytes: 4096, width: 100, height: 80,
+  })
+  assert.deepEqual(small, { width: 100, height: 80, maxBytes: 4096 })
+  const huge = adapter.imageRequestTarget('opencode-free', 'big-pickle', {
+    attachmentId: 'a2', mediaType: 'image/png', bytes: MAX_IMAGE_BYTES * 4, width: 4000, height: 3000,
+  })
+  assert.equal(huge.maxBytes, MAX_IMAGE_BYTES)
+  assert.equal(adapter.imageRequestPricing(), undefined)
+})
+
+test('UNKNOWN_MODEL on a turn triggers an immediate catalog refresh without delaying the error', async () => {
+  let modelFetches = 0
+  let chatFetches = 0
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    const target = String(url)
+    if (target.endsWith('/models')) {
+      modelFetches += 1
+      return jsonResponse(modelsEnvelope)
+    }
+    if (target.endsWith('/chat/completions')) {
+      chatFetches += 1
+      return jsonResponse({ error: { message: 'model x was delisted' } }, 404)
+    }
+    throw new Error('unexpected call')
+  })
+  const adapter = makeAdapter()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  const modelsBefore = modelFetches
+  await assert.rejects(
+    async () => {
+      for await (const _ of adapter.prepareCall(baseOptions).stream(baseOptions)) void _
+    },
+    (error: unknown) => error instanceof LlmFailureError && error.code === 'UNKNOWN_MODEL',
+  )
+  assert.equal(chatFetches, 1)
+  // Fire-and-forget refresh happens after the error surfaced.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.ok(modelFetches > modelsBefore, 'expected a post-failure catalog fetch')
+})
+
+test('turn metrics are mirrored into the on-disk health snapshot', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'dsh-metrics-'))
+  mock.method(globalThis, 'fetch', async (url: unknown) => {
+    if (String(url).endsWith('/models')) return jsonResponse(modelsEnvelope)
+    return jsonResponse({ error: { type: 'FreeTierError', message: 'locked' } }, 403)
+  })
+  const ctx = makeContext()
+  const adapter = new OpenCodeFreeAdapter({
+    logger: ctx.logger,
+    ctx,
+    config: { diskCache: true, dataDir },
+  })
+  await assert.rejects(async () => {
+    for await (const _ of adapter.prepareCall(baseOptions).stream(baseOptions)) void _
+  })
+  // Force a health write through a catalog refresh (the adapter records metrics in memory).
+  const catalog = (adapter as unknown as { catalog: { refresh(): Promise<void> } }).catalog
+  await catalog.refresh()
+  const healthPath = join(dataDir, 'adapter-status.json')
+  assert.ok(existsSync(healthPath))
+  const health = JSON.parse(readFileSync(healthPath, 'utf8')) as {
+    metrics: { turns: number; failures: Record<string, number>; lastFailure?: { code: string } }
+  }
+  assert.equal(health.metrics.turns, 1)
+  assert.equal(health.metrics.failures.LANE_LOCKED, 1)
+  assert.equal(health.metrics.lastFailure?.code, 'LANE_LOCKED')
 })
 
 test('resolveModel reports per-model context, output ceiling and reasoning menu', () => {

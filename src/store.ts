@@ -36,6 +36,7 @@ export interface HealthSnapshot {
   models: string[]
   lastError?: string
   source?: 'live' | 'cache' | 'static'
+  metrics?: unknown
 }
 
 export class JsonStore {

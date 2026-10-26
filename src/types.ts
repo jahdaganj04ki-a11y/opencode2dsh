@@ -161,6 +161,25 @@ export interface RetryPolicy {
   jitterRatio: number
 }
 
+/** Resolved normal-mode policy as captured by the host at adapter registration. */
+export interface ProviderRetryPolicy {
+  mode: 'normal'
+  maxRetries: number
+  retryableCodes: readonly string[]
+  backoff: {
+    initialDelayMs: number
+    maxDelayMs: number
+    jitterRatio: number
+  }
+}
+
+/** Structural mirror of dsh-attachment's ImageRequestTarget. */
+export interface ImageRequestTargetInfo {
+  width: number
+  height: number
+  maxBytes: number
+}
+
 // ── Host context (structural slice of the Cordis service container) ─────────
 
 export interface Logger {

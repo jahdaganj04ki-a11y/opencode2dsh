@@ -124,6 +124,34 @@ test('dispose stops the retry loop: no further fetches after teardown', async ()
   assert.ok(atDispose >= 2)
 })
 
+test('a listing without eligible free models never empties a working roster', async () => {
+  let phase: 'good' | 'empty' | 'recovered' = 'good'
+  let announcements = 0
+  mock.method(globalThis, 'fetch', async () => {
+    if (phase === 'good' || phase === 'recovered') return listingResponse(liveIds)
+    return listingResponse(['paid-console-model', 'another-paid-thing'])
+  })
+  const catalog = track(makeCatalog(() => {
+    announcements += 1
+  }))
+  catalog.start()
+  await catalog.warm(3000)
+  const goodIds = catalog.eligibleIds()
+  assert.ok(goodIds.length > 0)
+  const announcedAfterFirst = announcements
+
+  // Unusable listing: refresh rejects, the previous roster survives, no announcement.
+  phase = 'empty'
+  await assert.rejects(catalog.refresh())
+  assert.deepEqual(catalog.eligibleIds(), goodIds)
+  assert.equal(announcements, announcedAfterFirst)
+
+  // Gateway recovers: the roster updates again.
+  phase = 'recovered'
+  await catalog.refresh()
+  assert.deepEqual(catalog.eligibleIds(), goodIds)
+})
+
 test('when the live fetch never succeeds, listModels still answers from the static roster', async () => {
   mock.method(globalThis, 'fetch', async () => {
     throw new TypeError('offline')

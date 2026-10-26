@@ -177,6 +177,16 @@ export async function openGatewayStream(
   const controller = new AbortController()
   const detachExternal = linkSignal(signal, controller)
 
+  // Watchdog for the phase the stream generator cannot see: connect + TLS +
+  // response headers. The iterator arms its own first-event timer afterwards.
+  let connectTimedOut = false
+  // Referenced on purpose: bounds an in-flight request whose connect phase
+  // would otherwise never settle; the long-lived catalog timers are unref'd.
+  const connectTimer = setTimeout(() => {
+    connectTimedOut = true
+    controller.abort()
+  }, watchdogs.firstEventMs)
+
   let response: Response
   try {
     response = await fetch(url, {
@@ -187,6 +197,8 @@ export async function openGatewayStream(
       redirect: 'error',
     })
   } catch (error) {
+    clearTimeout(connectTimer)
+    if (connectTimedOut) throw new StreamTimeout('first-event')
     detachExternal()
     if (signal?.aborted) throw new GatewayFailure(signal.reason?.message ?? 'Request aborted.', CODE.ABORTED, undefined, undefined, undefined, false)
     if (controller.signal.aborted) throw new StreamTimeout('first-event')
@@ -195,6 +207,8 @@ export async function openGatewayStream(
       CODE.UPSTREAM, undefined, undefined, undefined, true,
     )
   }
+
+  clearTimeout(connectTimer)
 
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => '')
@@ -318,14 +332,50 @@ export function isDoneMarker(data: string): boolean {
   return data.trim() === '[DONE]'
 }
 
-/** Fetch the model listing; non-2xx answers become GatewayFailure like the chat lane. */
-export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: { accept: 'application/json', 'user-agent': 'opencode2dsh/0.1' },
-    signal,
-    redirect: 'error',
-  })
+export interface FetchJsonOptions {
+  signal?: AbortSignal
+  /** Bounds connect + headers + body; on expiry the call throws a retryable UPSTREAM failure. */
+  timeoutMs?: number
+}
+
+/** Fetch JSON (catalog listing); non-2xx answers become GatewayFailure like the chat lane. */
+export async function fetchJson<T>(url: string, options: FetchJsonOptions = {}): Promise<T> {
+  const controller = new AbortController()
+  const detach = linkSignal(options.signal, controller)
+  let timedOut = false
+  // Referenced on purpose: an in-flight request must keep the process alive
+  // until it settles or the deadline aborts it.
+  const timer = options.timeoutMs
+    ? setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, options.timeoutMs)
+    : undefined
+
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: { accept: 'application/json', 'user-agent': 'opencode2dsh/0.1' },
+      signal: controller.signal,
+      redirect: 'error',
+    })
+  } catch (error) {
+    if (timedOut) {
+      throw new GatewayFailure(`Catalog fetch timed out after ${options.timeoutMs} ms.`, CODE.UPSTREAM, undefined, undefined, undefined, true)
+    }
+    if (options.signal?.aborted) {
+      throw new GatewayFailure(options.signal.reason?.message ?? 'Request aborted.', CODE.ABORTED, undefined, undefined, undefined, false)
+    }
+    throw new GatewayFailure(
+      error instanceof Error ? error.message : 'Network error reaching the OpenCode gateway.',
+      CODE.UPSTREAM, undefined, undefined, undefined, true,
+    )
+  } finally {
+    if (timer) clearTimeout(timer)
+    detach()
+  }
+
   const text = await response.text()
   if (!response.ok) throw classifyFailure(response.status, text, response.headers.get('retry-after'))
   if (looksHtml(text)) throw new GatewayFailure('Gateway returned an HTML page instead of the catalog.', CODE.HTML_INTERSTITIAL, response.status)

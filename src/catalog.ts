@@ -66,7 +66,12 @@ export interface CatalogOptions {
    * Electron and passes `true` (unref); short-lived tests pass `false`.
    */
   unrefTimers?: boolean
+  /** Optional metrics snapshot merged into the on-disk health file. */
+  metrics?: () => unknown
 }
+
+/** Symmetric ±15 % jitter around the configured refresh interval. */
+const JITTER_RATIO = 0.15
 
 export class ModelCatalog {
   private ids: string[] = []
@@ -75,13 +80,14 @@ export class ModelCatalog {
   private hasLive = false
   private warmPromise: Promise<void> | undefined
   private refreshInFlight: Promise<void> | undefined
-  private refreshTimer: ReturnType<typeof setInterval> | undefined
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
   private started = false
   private disposed = false
   private publishedSignature: string | undefined
   private readonly retrySchedule: number[]
   private readonly unrefTimers: boolean
+  private readonly metricsProvider?: () => unknown
 
   constructor(
     private readonly config: ResolvedConfig,
@@ -93,6 +99,7 @@ export class ModelCatalog {
   ) {
     this.retrySchedule = options.retrySchedule && options.retrySchedule.length > 0 ? options.retrySchedule : DEFAULT_RETRY_SCHEDULE
     this.unrefTimers = options.unrefTimers !== false
+    this.metricsProvider = options.metrics
   }
 
   start(): void {
@@ -102,17 +109,28 @@ export class ModelCatalog {
     this.publishedSignature = this.rosterSignature()
     // First live fetch of the process; retries until it succeeds.
     this.warmPromise = this.initialLoop(0)
-    this.refreshTimer = setInterval(() => {
-      this.refresh().catch((error: unknown) => {
-        this.logger.warn?.('[opencode2dsh] scheduled catalog refresh failed', error)
-      })
-    }, this.config.refreshSeconds * 1000)
+    this.scheduleRefresh()
+  }
+
+  /** Self-rescheduling refresh with jitter so desktop instances desynchronize. */
+  private scheduleRefresh(): void {
+    if (this.disposed) return
+    const base = this.config.refreshSeconds * 1000
+    const delay = Math.round(base * (1 - JITTER_RATIO + Math.random() * 2 * JITTER_RATIO))
+    this.refreshTimer = setTimeout(() => {
+      if (this.disposed) return
+      this.refresh()
+        .catch((error: unknown) => {
+          this.logger.warn?.('[opencode2dsh] scheduled catalog refresh failed', error)
+        })
+        .finally(() => this.scheduleRefresh())
+    }, delay)
     this.keepLoose(this.refreshTimer)
   }
 
   dispose(): void {
     this.disposed = true
-    if (this.refreshTimer) clearInterval(this.refreshTimer)
+    if (this.refreshTimer) clearTimeout(this.refreshTimer)
     if (this.retryTimer) clearTimeout(this.retryTimer)
     this.refreshTimer = undefined
     this.retryTimer = undefined
@@ -189,7 +207,7 @@ export class ModelCatalog {
   private async doRefresh(): Promise<void> {
     const url = `${this.config.baseUrl}/inference/v1/models`
     try {
-      const envelope = await fetchJson<ListingEnvelope>(url)
+      const envelope = await fetchJson<ListingEnvelope>(url, { timeoutMs: this.config.listTimeoutMs })
       const rows = envelope.data ?? envelope.models ?? []
       // De-duplicate defensively: the host rejects a catalog with repeated
       // ids (INVALID_CATALOG), so never let a quirky listing through as-is.
@@ -200,6 +218,15 @@ export class ModelCatalog {
       )]
       if (ids.length === 0) {
         throw new GatewayFailure('Gateway listing returned no models.', CODE.UPSTREAM, undefined, undefined, undefined, true)
+      }
+      // Never replace a working roster with one that exposes nothing: a gate
+      // change or intermediary quirk must empty the picker, not hide models.
+      const nextEligible = this.eligibleFrom(ids)
+      if (nextEligible.length === 0 && this.eligibleIds().length > 0) {
+        throw new GatewayFailure(
+          'Gateway listing contained no eligible free models; keeping the previous roster.',
+          CODE.UPSTREAM, undefined, undefined, undefined, true,
+        )
       }
       this.ids = ids
       this.hasLive = true
@@ -218,6 +245,26 @@ export class ModelCatalog {
       this.logger.warn?.(`[opencode2dsh] catalog refresh failed (${this.lastError}); serving ${this.ids.length} cached/static ids`)
       throw error
     }
+  }
+
+  /** Eligibility rules applied to an arbitrary id list (pre-commit check). */
+  private eligibleFrom(ids: string[]): string[] {
+    const allow = this.config.allowedModels
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const id of ids) {
+      if (seen.has(id)) continue
+      if (allow.length > 0 && !allow.includes(id)) continue
+      if (!isFreeId(id)) continue
+      const reason = blockReason(id)
+      if (reason) {
+        this.logger.debug?.(`[opencode2dsh] hiding ${id}: ${reason}`)
+        continue
+      }
+      seen.add(id)
+      out.push(id)
+    }
+    return out
   }
 
   private rosterSignature(): string {
@@ -248,22 +295,7 @@ export class ModelCatalog {
 
   /** Apply free-rule, blocklist, allowlist and de-dupe to the raw ids. */
   eligibleIds(): string[] {
-    const allow = this.config.allowedModels
-    const out: string[] = []
-    const seen = new Set<string>()
-    for (const id of this.ids) {
-      if (seen.has(id)) continue
-      if (allow.length > 0 && !allow.includes(id)) continue
-      if (!isFreeId(id)) continue
-      const reason = blockReason(id)
-      if (reason) {
-        this.logger.debug?.(`[opencode2dsh] hiding ${id}: ${reason}`)
-        continue
-      }
-      seen.add(id)
-      out.push(id)
-    }
-    return out
+    return this.eligibleFrom(this.ids)
   }
 
   async listModels(provider: string): Promise<ModelInfo[]> {
@@ -289,6 +321,7 @@ export class ModelCatalog {
       models: this.eligibleIds(),
       ...(this.lastError ? { lastError: this.lastError } : {}),
       source,
+      ...(this.metricsProvider ? { metrics: this.metricsProvider() } : {}),
     }
     this.store.write(HEALTH_FILE, snapshot)
   }
@@ -296,7 +329,7 @@ export class ModelCatalog {
 
 /** Minimal listing fetch used by the standalone smoke script. */
 export async function fetchListing(baseUrl: string): Promise<string[]> {
-  const envelope = await fetchJson<ListingEnvelope>(`${baseUrl}/inference/v1/models`)
+  const envelope = await fetchJson<ListingEnvelope>(`${baseUrl}/inference/v1/models`, { timeoutMs: 30_000 })
   const rows = envelope.data ?? envelope.models ?? []
   return [...new Set(rows.map((row) => (typeof row.id === 'string' ? row.id : '')).filter(Boolean))]
 }
