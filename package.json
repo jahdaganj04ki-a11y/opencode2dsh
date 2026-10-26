@@ -1,0 +1,53 @@
+{
+  "name": "opencode2dsh",
+  "version": "0.1.0",
+  "description": "DSH (DeepSeek Harness / DSH Desktop) plugin: use OpenCode's free models inside DSH with per-model endpoints, vision, context, output and reasoning settings — no API key, no extra process.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.de.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --legal-comments=none",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "smoke": "node --import tsx scripts/smoke.ts",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh-desktop",
+    "opencode",
+    "opencode-zen",
+    "free-models",
+    "free-llm",
+    "llm-provider",
+    "cordis",
+    "cordis-plugin"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.0"
+  }
+}

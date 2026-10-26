@@ -1,0 +1,10 @@
+# opencode2dsh — DSH bundle patch.
+#
+# Inserts the plugin row into the profile's Cordis composition. The bundle
+# declaration in package.json ("dsh.bundle.patch") points the plugin manager /
+# dsh-market at this file. Override any option through `config` (see README.md,
+# section "Configuration"); the defaults below need no editing.
+- insert:
+    - id: opencode-free
+      name: 'opencode2dsh'
+      config: {}
